@@ -1139,6 +1139,95 @@ This also works with generators:
 
 Tuples and lists are both supported.
 
+.. _python_api_type_strategy:
+
+Explicit column type strategies
+===============================
+
+When the same data source is imported in several batches, the first batch
+decides the schema: a column that looked like an integer may later gain a
+fractional part, and an identifier such as ``"0012"`` may arrive after the
+column was already created as a number. ``ColumnTypeStrategy`` tracks the
+inferred type of every column across batches, widens a column only when a
+later batch requires it, and records a machine-readable reason for every
+decision:
+
+.. code-block:: python
+
+    from sqlite_utils import Database
+    from sqlite_utils.type_strategy import ColumnTypeStrategy
+
+    db = Database(memory=True)
+    strategy = ColumnTypeStrategy(identifiers=["code"])
+    table = db["measurements"]
+
+    strategy.apply_to_table(table, [{"code": "0012", "temp": 21}])
+    strategy.apply_to_table(table, [{"code": "0007", "temp": 21.5}])
+
+    print(strategy.sql_types())
+    # {'code': 'TEXT', 'temp': 'REAL'}
+
+    print(db.execute("select code, typeof(code), temp, typeof(temp) "
+                     "from measurements").fetchall())
+    # [('0012', 'text', 21.0, 'real'), ('0007', 'text', 21.5, 'real')]
+
+    for decision in strategy.explain("temp"):
+        print(decision.action, decision.previous_kind, "->", decision.kind,
+              "-", decision.reason)
+    # infer None -> INTEGER - whole-number measurement fits an INTEGER column
+    # promote INTEGER -> REAL - fractional measurement requires REAL; INTEGER would truncate it
+
+The strategy distinguishes *measurements* from *identifiers*:
+
+- **Measurements** (the default) treat ``int``/``float`` values as numbers.
+  An ``INTEGER`` column widens to ``REAL`` when a fractional value arrives,
+  and any column widens to ``TEXT`` when a value cannot be represented as a
+  SQLite number - for example an integer larger than 64 bits, which is stored
+  as exact text so no digits are lost.
+- **Identifiers** (columns listed in ``identifiers=[...]``) are always stored
+  as ``TEXT``, even when every value looks like a number. Codes such as
+  ``"0012"`` keep their leading zeros, and big numeric identifiers keep every
+  digit.
+
+Strings are never converted to numbers by default. Pass
+``parse_numeric_strings=True`` to convert exact integer/float literals in
+measurement columns - leading-zero literals are still never converted.
+
+You can pin a column's type with ``fixed_types=`` (a Python type, a SQLite
+type string or a ``ColumnKind``). Fixed columns are never widened; a batch
+containing a value that does not fit is rejected:
+
+.. code-block:: python
+
+    strategy = ColumnTypeStrategy(fixed_types={"count": int})
+    strategy.apply_to_table(db["t"], [{"count": 5}])
+    strategy.apply_to_table(db["t"], [{"count": 1.25}])
+    # raises BatchRejected: column is fixed to INTEGER and cannot be widened
+
+A rejected batch is never half-imported: inference, any table rebuild and the
+insert all run inside one transaction, and the strategy state is rolled back
+too, so the batch can be fixed and resubmitted.
+
+When a batch requires widening a column of an existing table, the table is
+rebuilt - but only after every existing row has been checked for a lossless
+conversion. An ``INTEGER`` column holding ``9007199254740993`` (larger than
+2**53) refuses to widen to ``REAL``, because the float would lose precision;
+a ``TEXT`` column holding ``"0012"`` refuses to narrow to ``INTEGER``,
+because the leading zeros would be rewritten.
+
+The decision log can be serialized and replayed to reproduce the exact same
+schema, rather than only the final ``CREATE TABLE`` statement:
+
+.. code-block:: python
+
+    log = strategy.to_log()          # JSON-serializable list of decisions
+    replayed = ColumnTypeStrategy.from_log(log, identifiers=["code"])
+    assert replayed.sql_types() == strategy.sql_types()
+
+``strategy.to_json()`` / ``ColumnTypeStrategy.from_json()`` serialize the
+complete state, including rejections. See :ref:`reference_type_strategy` for
+the full API.
+
 .. _python_api_insert_replace:
 
 Insert-replacing data

@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _unreleased:
+
+Unreleased
+----------
+
+- New ``sqlite_utils.type_strategy.ColumnTypeStrategy`` provides an explicit, replayable column type policy for imports that arrive in several batches. It distinguishes numeric measurements from identifier text (so codes such as ``"0012"`` are never rewritten as numbers), widens ``INTEGER`` columns to ``REAL`` when fractional values arrive, stores integers outside the 64-bit range as exact text, handles booleans, blobs, nulls and missing columns, checks every existing row for a lossless migration before rebuilding a table, supports caller-fixed column types, and rejects an entire batch atomically instead of importing half of it. Every inference, promotion and rejection records a reason that can be serialized and replayed via ``to_log()`` / ``from_log()``. See :ref:`python_api_type_strategy`.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

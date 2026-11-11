@@ -115,3 +115,13 @@ sqlite_utils.utils.flatten
 --------------------------
 
 .. autofunction:: sqlite_utils.utils.flatten
+
+.. _reference_type_strategy:
+
+sqlite_utils.type_strategy
+--------------------------
+
+.. automodule:: sqlite_utils.type_strategy
+   :members:
+   :undoc-members:
+   :exclude-members: ValueClass
