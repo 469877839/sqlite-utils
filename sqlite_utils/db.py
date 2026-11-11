@@ -13,7 +13,7 @@ import secrets
 import textwrap
 import uuid
 from collections import namedtuple
-from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import (
@@ -477,6 +477,96 @@ class BadMultiValues(Exception):
 
     def __init__(self, values: object) -> None:
         self.values = values
+
+
+@dataclass(frozen=True)
+class RejectedRow:
+    """
+    A record that a bulk insert or upsert refused to write when called with
+    ``reject_bad_rows=True``, because writing it violated a constraint
+    (unique, not-null, CHECK or foreign key).
+
+    ``index`` is the zero-based position of the record in the input
+    sequence, so callers can tell rejected and accepted input apart without
+    re-reading the input. ``record`` is the original record object.
+    ``error`` is the SQLite diagnostic message and ``sqlite_errorcode`` /
+    ``sqlite_errorname`` carry the extended SQLite error details when the
+    installed driver exposes them.
+    """
+
+    index: int
+    record: Any
+    error: str
+    error_type: str = "IntegrityError"
+    sqlite_errorcode: int | None = None
+    sqlite_errorname: str | None = None
+
+    def __iter__(self) -> Iterator[Any]:
+        # Allow tuple-style unpacking: index, record, error = rejected_row
+        return iter((self.index, self.record, self.error))
+
+    def __len__(self) -> int:
+        return 3
+
+    def __getitem__(self, item: int) -> Any:
+        return (self.index, self.record, self.error)[item]
+
+    @property
+    def row(self) -> Any:
+        "Alias for the original rejected ``record``."
+        return self.record
+
+    @property
+    def message(self) -> str:
+        "Alias for the SQLite ``error`` message."
+        return self.error
+
+    @property
+    def input_index(self) -> int:
+        "Alias for the zero-based ``index`` in the input sequence."
+        return self.index
+
+
+class RejectedRows(list[RejectedRow]):
+    """
+    The list of :class:`RejectedRow` objects returned by
+    :meth:`Table.insert_all` and :meth:`Table.upsert_all` when called with
+    ``reject_bad_rows=True``.
+
+    The rows are stored in input order even though the offending records are
+    found by recursively splitting failed batches. ``processed`` and
+    ``inserted`` count the input records and the records that were written.
+    """
+
+    def __init__(self, iterable: Iterable[RejectedRow] = ()) -> None:
+        super().__init__(iterable)
+        self.processed = 0
+        self.inserted = 0
+
+    @property
+    def ok(self) -> bool:
+        "``True`` when every input record was written."
+        return not self
+
+    @property
+    def indexes(self) -> list[int]:
+        "Zero-based input indexes of the rejected records, in input order."
+        return [rejected.index for rejected in self]
+
+    @property
+    def rejected(self) -> "RejectedRows":
+        "Alias for this list, for ``result.rejected`` style access."
+        return self
+
+    @property
+    def records(self) -> list[Any]:
+        "The original records that were rejected, in input order."
+        return [rejected.record for rejected in self]
+
+    @property
+    def errors(self) -> list[str]:
+        "The SQLite diagnostics for the rejected records, in input order."
+        return [rejected.error for rejected in self]
 
 
 _COUNTS_TABLE_CREATE_SQL = """
@@ -1191,8 +1281,12 @@ class Database:
     @property
     def sqlite_version(self) -> tuple[int, ...]:
         "Version of SQLite, as a tuple of integers for example ``(3, 36, 0)``."
-        row = self.execute("select sqlite_version()").fetchall()[0]
-        return tuple(map(int, row[0].split(".")))
+        cached = getattr(self, "_cached_sqlite_version", None)
+        if cached is None:
+            row = self.execute("select sqlite_version()").fetchall()[0]
+            cached = tuple(map(int, row[0].split(".")))
+            self._cached_sqlite_version = cached
+        return cached
 
     @property
     def journal_mode(self) -> str:
@@ -2281,6 +2375,8 @@ class Table(Queryable):
     last_rowid: int | None = None
     #: The primary key of the last inserted, updated or selected row.
     last_pk: Any | None = None
+    #: Rejected rows from the most recent ``insert_all(reject_bad_rows=True)``.
+    rejects: "RejectedRows | None" = None
 
     def __init__(
         self,
@@ -4302,6 +4398,26 @@ class Table(Queryable):
                 self.transform(drop=(column,))
         return self
 
+    def _is_without_rowid(self) -> bool:
+        "True if this table was created with ``WITHOUT ROWID``."
+        if not self.exists():
+            return False
+        # WITHOUT ROWID is immutable for the lifetime of a table, so cache it
+        if hasattr(self, "_cached_without_rowid"):
+            return self._cached_without_rowid
+        without_rowid = "without rowid" in self.schema.lower()
+        self._cached_without_rowid = without_rowid
+        return without_rowid
+
+    def _returning_sql(self) -> str:
+        """
+        Column list for a ``RETURNING`` clause that identifies each written
+        row: ``rowid`` for rowid tables, the primary key columns otherwise.
+        """
+        if not self._is_without_rowid():
+            return "rowid"
+        return ", ".join(quote_identifier(pk_column) for pk_column in self.pks)
+
     def build_insert_queries_and_params(
         self,
         extracts,
@@ -4317,12 +4433,19 @@ class Table(Queryable):
         replace,
         ignore,
         list_mode=False,
+        returning=False,
     ):
         """
         Given a list ``chunk`` of records that should be written to *this* table,
         return a list of ``(sql, parameters)`` 2-tuples which, when executed in
         order, perform the desired INSERT / UPSERT / REPLACE operation.
+
+        With ``returning=True`` the single-statement bulk paths end with a
+        ``RETURNING`` clause naming ``rowid`` (or the primary key columns for a
+        ``WITHOUT ROWID`` table), so inserted rows can be mapped back to input
+        records. The legacy per-row upsert path does not support this.
         """
+        returning_sql = self._returning_sql() if returning else ""
         # Dict-mode insert({}) has no explicit columns; SQLite spells that as
         # DEFAULT VALUES. List mode with no columns is a different input shape.
         if not list_mode and not all_columns:
@@ -4340,6 +4463,8 @@ class Table(Queryable):
                 f"INSERT{or_clause} INTO {quote_identifier(self.name)} "
                 "DEFAULT VALUES"
             )
+            if returning_sql:
+                sql = f"{sql} RETURNING {returning_sql}"
             return [(sql, []) for _ in chunk]
 
         if hash_id_columns and hash_id is None:
@@ -4403,6 +4528,8 @@ class Table(Queryable):
                 f"INSERT OR REPLACE INTO {quote_identifier(self.name)} "
                 f"({columns_sql}) VALUES {row_placeholders_sql}"
             )
+            if returning_sql:
+                sql = f"{sql} RETURNING {returning_sql}"
             return [(sql, flat_params)]
 
         # If not an upsert it's an INSERT, maybe with OR IGNORE
@@ -4414,6 +4541,8 @@ class Table(Queryable):
                 f"INSERT{or_ignore} INTO {quote_identifier(self.name)} "
                 f"({columns_sql}) VALUES {row_placeholders_sql}"
             )
+            if returning_sql:
+                sql = f"{sql} RETURNING {returning_sql}"
             return [(sql, flat_params)]
 
         # Everything from here on is for upsert=True
@@ -4465,6 +4594,8 @@ class Table(Queryable):
                 f"VALUES {row_placeholders_sql} "
                 f"ON CONFLICT({conflict_sql}) {do_clause}"
             )
+            if returning_sql:
+                sql = f"{sql} RETURNING {returning_sql}"
             return [(sql, flat_params)]
 
         # At this point we need compatibility UPSERT for SQLite < 3.24.0
@@ -4534,6 +4665,43 @@ class Table(Queryable):
         ignore,
         list_mode=False,
     ) -> sqlite3.Cursor | None:
+        result, _ = self._execute_insert_chunk(
+            alter,
+            extracts,
+            chunk,
+            all_columns,
+            hash_id,
+            hash_id_columns,
+            upsert,
+            pk,
+            not_null,
+            conversions,
+            num_records_processed,
+            replace,
+            ignore,
+            list_mode,
+            returning=False,
+        )
+        return result
+
+    def _execute_insert_chunk(
+        self,
+        alter,
+        extracts,
+        chunk,
+        all_columns,
+        hash_id,
+        hash_id_columns,
+        upsert,
+        pk,
+        not_null,
+        conversions,
+        num_records_processed,
+        replace,
+        ignore,
+        list_mode,
+        returning,
+    ) -> tuple[sqlite3.Cursor | None, list[Any]]:
         queries_and_params = self.build_insert_queries_and_params(
             extracts,
             chunk,
@@ -4548,8 +4716,10 @@ class Table(Queryable):
             replace,
             ignore,
             list_mode,
+            returning=returning,
         )
         result = None
+        returned_rows: list[Any] = []
         with self.db.atomic():
             for query, params in queries_and_params:
                 try:
@@ -4563,7 +4733,7 @@ class Table(Queryable):
                         first_half = chunk[: len(chunk) // 2]
                         second_half = chunk[len(chunk) // 2 :]
 
-                        self.insert_chunk(
+                        _, first_rows = self._execute_insert_chunk(
                             alter,
                             extracts,
                             first_half,
@@ -4578,9 +4748,10 @@ class Table(Queryable):
                             replace,
                             ignore,
                             list_mode,
+                            returning,
                         )
 
-                        result = self.insert_chunk(
+                        result, second_rows = self._execute_insert_chunk(
                             alter,
                             extracts,
                             second_half,
@@ -4595,11 +4766,286 @@ class Table(Queryable):
                             replace,
                             ignore,
                             list_mode,
+                            returning,
                         )
-
+                        returned_rows.extend(first_rows)
+                        returned_rows.extend(second_rows)
+                        # The recursive calls already fetched their cursors
+                        continue
                     else:
                         raise
-        return result
+                if returning and result.description is not None:
+                    # Fetch before the savepoint is released: a RETURNING
+                    # cursor left open blocks the transaction control call
+                    returned_rows.extend(result.fetchall())
+        return result, returned_rows
+
+    def _integrity_error_to_rejected(
+        self, index: int, record: Any, exception: sqlite3.IntegrityError
+    ) -> RejectedRow:
+        return RejectedRow(
+            index=index,
+            record=record,
+            error=str(exception.args[0]),
+            error_type=type(exception).__name__,
+            sqlite_errorcode=getattr(exception, "sqlite_errorcode", None),
+            sqlite_errorname=getattr(exception, "sqlite_errorname", None),
+        )
+
+    def _insert_chunk_rejecting(
+        self,
+        alter,
+        extracts,
+        chunk,
+        indexes,
+        all_columns,
+        hash_id,
+        hash_id_columns,
+        upsert,
+        pk,
+        not_null,
+        conversions,
+        num_records_processed,
+        replace,
+        ignore,
+        list_mode,
+        rejects,
+        defer_foreign_keys,
+        pragma_needed=True,
+        returning=None,
+    ) -> sqlite3.Cursor | None:
+        """
+        Insert one chunk while collecting constraint failures into
+        ``rejects``.
+
+        The whole chunk is written with the usual bulk statement first. Only
+        if SQLite raises ``IntegrityError`` is that statement rolled back and
+        the chunk split in half, recursively. Recursion walks the input in
+        order, so when the same key occurs twice in one batch the earlier
+        input record is the one that is kept and the later one is rejected.
+        A single-record failure is the base case and produces a
+        :class:`RejectedRow`.
+
+        With foreign keys deferred, integrity checks other than foreign keys
+        still fire immediately, so the same recursion localizes them; foreign
+        key failures are reconciled once per successfully written payload via
+        ``PRAGMA foreign_key_check``.
+        """
+        if returning is None:
+            returning = self.db.sqlite_version >= (3, 35, 0)
+            if upsert and (
+                self.db.use_old_upsert or not self.db.supports_on_conflict
+            ):
+                # The compatibility upsert runs per-record INSERT/UPDATE
+                # pairs, so there is no single RETURNING handle for deferred
+                # foreign key reconciliation
+                returning = False
+        with self.db.atomic():
+            if defer_foreign_keys and pragma_needed:
+                self.db.execute("PRAGMA defer_foreign_keys = ON")
+            try:
+                result, returned_rows = self._execute_insert_chunk(
+                    alter,
+                    extracts,
+                    chunk,
+                    all_columns,
+                    hash_id,
+                    hash_id_columns,
+                    upsert,
+                    pk,
+                    not_null,
+                    conversions,
+                    num_records_processed,
+                    replace,
+                    ignore,
+                    list_mode,
+                    returning=returning,
+                )
+            except sqlite3.IntegrityError as exception:
+                if len(chunk) == 1:
+                    rejects.append(
+                        self._integrity_error_to_rejected(
+                            indexes[0], chunk[0], exception
+                        )
+                    )
+                    return None
+                midpoint = len(chunk) // 2
+                left_result = self._insert_chunk_rejecting(
+                    alter,
+                    extracts,
+                    chunk[:midpoint],
+                    indexes[:midpoint],
+                    all_columns,
+                    hash_id,
+                    hash_id_columns,
+                    upsert,
+                    pk,
+                    not_null,
+                    conversions,
+                    num_records_processed,
+                    replace,
+                    ignore,
+                    list_mode,
+                    rejects,
+                    defer_foreign_keys,
+                    pragma_needed=False,
+                    returning=returning,
+                )
+                right_result = self._insert_chunk_rejecting(
+                    alter,
+                    extracts,
+                    chunk[midpoint:],
+                    indexes[midpoint:],
+                    all_columns,
+                    hash_id,
+                    hash_id_columns,
+                    upsert,
+                    pk,
+                    not_null,
+                    conversions,
+                    num_records_processed,
+                    replace,
+                    ignore,
+                    list_mode,
+                    rejects,
+                    defer_foreign_keys,
+                    pragma_needed=False,
+                    returning=returning,
+                )
+                return right_result or left_result
+            if defer_foreign_keys:
+                result = self._reject_foreign_key_failures(
+                    chunk,
+                    indexes,
+                    returned_rows,
+                    returning,
+                    rejects,
+                    result,
+                )
+            return result
+
+    def _foreign_key_violated_keys(self) -> set[tuple]:
+        """
+        Keys of rows in this table that currently violate a foreign key,
+        expressed the same way the bulk ``RETURNING`` clause reports written
+        rows: a one-item ``(rowid,)`` tuple for rowid tables, the primary key
+        column values for ``WITHOUT ROWID`` tables.
+        """
+        if not self._is_without_rowid():
+            return {
+                (row[1],)
+                for row in self.db.execute(
+                    f"PRAGMA foreign_key_check({quote_identifier(self.name)})"
+                ).fetchall()
+            }
+        # WITHOUT ROWID tables have no rowid for foreign_key_check to report,
+        # so find the offending rows with a correlated NOT EXISTS probe per
+        # foreign key. Explicit aliases matter for self-referential keys.
+        child_alias = "child"
+        parent_alias = "parent"
+        select_keys = ", ".join(
+            f"{child_alias}.{quote_identifier(column)}" for column in self.pks
+        )
+        keys: set[tuple] = set()
+        for foreign_key in self.foreign_keys:
+            parent_columns = foreign_key.other_columns
+            child_columns = foreign_key.columns
+            if not parent_columns or not child_columns:
+                continue
+            join = " and ".join(
+                "{parent_alias}.{parent_column} = {child_alias}.{child_column}".format(
+                    parent_alias=parent_alias,
+                    parent_column=quote_identifier(parent_column),
+                    child_alias=child_alias,
+                    child_column=quote_identifier(child_column),
+                )
+                for parent_column, child_column in zip(parent_columns, child_columns)
+            )
+            not_null = " and ".join(
+                "{child_alias}.{child_column} is not null".format(
+                    child_alias=child_alias,
+                    child_column=quote_identifier(child_column),
+                )
+                for child_column in child_columns
+            )
+            sql = (
+                "select {select_keys} from {table} as {child_alias} "
+                "where {not_null} and not exists ("
+                "select 1 from {parent} as {parent_alias} where {join})"
+            ).format(
+                select_keys=select_keys,
+                table=quote_identifier(self.name),
+                child_alias=child_alias,
+                not_null=not_null,
+                parent=quote_identifier(foreign_key.other_table),
+                parent_alias=parent_alias,
+                join=join,
+            )
+            keys.update(tuple(row) for row in self.db.execute(sql).fetchall())
+        return keys
+
+    def _reject_foreign_key_failures(
+        self,
+        chunk,
+        indexes,
+        returned_rows,
+        returning,
+        rejects,
+        result,
+    ) -> sqlite3.Cursor | None:
+        """
+        Deferred foreign keys only fail at transaction commit, which would
+        lose the row-level diagnostics. Read the violated rows now, map them
+        back to input positions and delete them, leaving the chunk's
+        transaction in a state that can commit.
+        """
+        if not returning:
+            # No row handle for the rows just written: either SQLite predates
+            # RETURNING (3.35) or the compatibility per-record upsert is in
+            # use. Fail loudly rather than guess which rows violated the key.
+            raise sqlite3.OperationalError(
+                "reject_bad_rows cannot localize foreign key failures with "
+                "the per-record upsert or SQLite older than 3.35"
+            )
+        without_rowid = self._is_without_rowid()
+        delete_sql = "delete from {table} where {matcher}".format(
+            table=quote_identifier(self.name),
+            matcher="rowid = ?"
+            if not without_rowid
+            else " and ".join(
+                f"{quote_identifier(pk_column)} = ?" for pk_column in self.pks
+            ),
+        )
+        remaining = set(range(len(returned_rows)))
+        while True:
+            violated_keys = self._foreign_key_violated_keys()
+            if not violated_keys:
+                return result
+            violated_positions = {
+                position
+                for position in remaining
+                if tuple(returned_rows[position]) in violated_keys
+            }
+            if not violated_positions:
+                # Violations belong to rows this payload did not write -
+                # surface them rather than fail later at commit time
+                raise sqlite3.IntegrityError("FOREIGN KEY constraint failed")
+            for position in sorted(violated_positions):
+                cursor = self.db.execute(delete_sql, list(returned_rows[position]))
+                if cursor.rowcount:
+                    remaining.discard(position)
+                    rejects.append(
+                        RejectedRow(
+                            index=indexes[position],
+                            record=chunk[position],
+                            error="FOREIGN KEY constraint failed",
+                            error_type="IntegrityError",
+                            sqlite_errorcode=787,
+                            sqlite_errorname="SQLITE_CONSTRAINT_FOREIGNKEY",
+                        )
+                    )
+            # Deleting a rejected row can orphan a row that referenced it, so
+            # loop until no written row violates a foreign key anymore
 
     def insert(
         self,
@@ -4691,12 +5137,23 @@ class Table(Queryable):
         upsert: bool = False,
         analyze: bool = False,
         strict: bool | Default | None = DEFAULT,
-    ) -> "Table":
+        reject_bad_rows: bool = False,
+    ) -> "Table | RejectedRows":
         """
         Like ``.insert()`` but takes a list of records and ensures that the table
         that it creates (if table does not exist) has columns for ALL of that data.
 
         Use ``analyze=True`` to run ``ANALYZE`` after the insert has completed.
+
+        Pass ``reject_bad_rows=True`` to keep the records that fail a
+        constraint (unique, not-null, CHECK or foreign key) out of the table
+        instead of rolling the batch back: valid records are written and the
+        method returns a :class:`RejectedRows` list describing each rejected
+        record, its zero-based input index and the SQLite diagnostic. The
+        default remains the previous all-or-nothing behavior, raising
+        ``sqlite3.IntegrityError``. Errors that are not row-level constraint
+        violations - disk errors, lost connections, SQL construction errors -
+        still fail the whole operation.
         """
         pk = self.value_or_default("pk", pk)
         foreign_keys = self.value_or_default("foreign_keys", foreign_keys)
@@ -4763,9 +5220,28 @@ class Table(Queryable):
 
         if ignore and replace:
             raise ValueError("Use either ignore=True or replace=True, not both")
+        if reject_bad_rows and (ignore or replace):
+            raise ValueError(
+                "reject_bad_rows=True cannot be combined with ignore=True or replace=True"
+            )
         all_columns = []
         first = True
         num_records_processed = 0
+        rejects = RejectedRows()
+        if reject_bad_rows:
+            self.rejects = rejects
+        # Deferred foreign keys keep a whole valid batch writable while a
+        # sibling record is being localized; constraints that can only be
+        # checked at commit are reconciled per chunk with foreign_key_check.
+        # The table may not exist yet, so this is finalized on the first chunk.
+        defer_foreign_keys = False
+        fk_status_checked = False
+        if reject_bad_rows and self.exists():
+            fk_status_checked = True
+            if self.foreign_keys:
+                defer_foreign_keys = bool(
+                    self.db.execute("PRAGMA foreign_keys").fetchone()[0]
+                )
 
         # Detect if we're using list-based iteration or dict-based iteration
         list_mode = False
@@ -4779,7 +5255,7 @@ class Table(Queryable):
         try:
             first_record = next(records_iter)
         except StopIteration:
-            return self  # It was an empty list
+            return rejects if reject_bad_rows else self  # It was an empty list
 
         # Check if this is list mode or dict mode
         if isinstance(first_record, (list, tuple)):
@@ -4796,7 +5272,7 @@ class Table(Queryable):
             try:
                 first_record = next(records_iter)
             except StopIteration:
-                return self  # Only headers, no data
+                return rejects if reject_bad_rows else self  # Only headers, no data
             if not isinstance(first_record, (list, tuple)):
                 raise ValueError(  # noqa: TRY004
                     "After column names list, all subsequent records must also be lists"
@@ -4807,7 +5283,7 @@ class Table(Queryable):
             try:
                 first_record = next(records_iter)
             except StopIteration:
-                return self
+                return rejects if reject_bad_rows else self
             first_record = cast(dict[str, Any], first_record)
             num_columns = len(first_record.keys())
 
@@ -4826,6 +5302,7 @@ class Table(Queryable):
         result = None
         for chunk in chunks(itertools.chain([first_record], records_iter), batch_size):
             chunk = list(chunk)
+            chunk_base_index = num_records_processed
             num_records_processed += len(chunk)
             if first:
                 if not self.exists():
@@ -4887,25 +5364,61 @@ class Table(Queryable):
 
             first = False
 
-            result = self.insert_chunk(
-                alter,
-                extracts,
-                chunk,
-                all_columns,
-                hash_id,
-                hash_id_columns,
-                upsert,
-                pk,
-                not_null,
-                conversions,
-                num_records_processed,
-                replace,
-                ignore,
-                list_mode,
-            )
+            if reject_bad_rows and not fk_status_checked:
+                # The table may have been created above, with foreign keys
+                fk_status_checked = True
+                if self.foreign_keys:
+                    defer_foreign_keys = bool(
+                        self.db.execute("PRAGMA foreign_keys").fetchone()[0]
+                    )
+            if reject_bad_rows:
+                indexes = list(
+                    range(chunk_base_index, chunk_base_index + len(chunk))
+                )
+                result = self._insert_chunk_rejecting(
+                    alter,
+                    extracts,
+                    chunk,
+                    indexes,
+                    all_columns,
+                    hash_id,
+                    hash_id_columns,
+                    upsert,
+                    pk,
+                    not_null,
+                    conversions,
+                    num_records_processed,
+                    replace,
+                    ignore,
+                    list_mode,
+                    rejects,
+                    defer_foreign_keys,
+                )
+            else:
+                result = self.insert_chunk(
+                    alter,
+                    extracts,
+                    chunk,
+                    all_columns,
+                    hash_id,
+                    hash_id_columns,
+                    upsert,
+                    pk,
+                    not_null,
+                    conversions,
+                    num_records_processed,
+                    replace,
+                    ignore,
+                    list_mode,
+                )
 
         # If we only handled a single row populate self.last_pk
-        if num_records_processed == 1:
+        if reject_bad_rows and rejects and num_records_processed == 1:
+            # The only input record was rejected; make sure the legacy
+            # per-record upsert path cannot leave a stale last_pk behind
+            self.last_pk = None
+            self.last_rowid = None
+        elif num_records_processed == 1:
             # For an insert we need to use result.lastrowid
             if not upsert and result is not None:
                 ignored_insert = ignore and result.rowcount == 0
@@ -5026,6 +5539,12 @@ class Table(Queryable):
         if analyze:
             self.analyze()
 
+        if reject_bad_rows:
+            rejects.sort(key=lambda rejected: rejected.index)
+            rejects.processed = num_records_processed
+            rejects.inserted = num_records_processed - len(rejects)
+            self.rejects = rejects
+            return rejects
         return self
 
     def upsert(
@@ -5083,9 +5602,15 @@ class Table(Queryable):
         columns: dict[str, Any] | Default | None = DEFAULT,
         analyze: bool = False,
         strict: bool | Default | None = DEFAULT,
-    ) -> "Table":
+        reject_bad_rows: bool = False,
+    ) -> "Table | RejectedRows":
         """
         Like ``.upsert()`` but can be applied to a list of records.
+
+        Pass ``reject_bad_rows=True`` to write the valid records and return a
+        :class:`RejectedRows` list describing each record that violated a
+        constraint, instead of raising ``sqlite3.IntegrityError``. See
+        :meth:`insert_all` for details.
         """
         return self.insert_all(
             records,
@@ -5104,6 +5629,7 @@ class Table(Queryable):
             upsert=True,
             analyze=analyze,
             strict=strict,
+            reject_bad_rows=reject_bad_rows,
         )
 
     def add_missing_columns(self, records: Iterable[dict[str, Any]]) -> "Table":

@@ -1107,6 +1107,35 @@ You can delete all the existing rows in the table before inserting the new recor
 
 Pass ``analyze=True`` to run ``ANALYZE`` against the table after inserting the new records.
 
+.. _python_api_reject_bad_rows:
+
+Rejecting rows that violate constraints
+---------------------------------------
+
+Normally a single bad row - for example two records sharing the same unique key - makes the whole batch statement fail with ``sqlite3.IntegrityError``, and the batch is rolled back. If only two rows out of thousands are bad, finding which two means replaying the data row by row yourself.
+
+Pass ``reject_bad_rows=True`` to ``insert_all()`` or ``upsert_all()`` to switch on an explicit rejection mode instead. Records that pass every constraint are written; records that violate a unique, not-null, CHECK or foreign key constraint are skipped and returned as a list of :class:`~sqlite_utils.db.RejectedRow` objects, each carrying:
+
+- ``index`` - the zero-based position of the record in the input sequence
+- ``record`` - the original record that was rejected
+- ``error`` - the SQLite diagnostic message
+- ``error_type``, ``sqlite_errorcode`` and ``sqlite_errorname`` - extra diagnostics when the SQLite driver exposes them
+
+The result is a :class:`~sqlite_utils.db.RejectedRows` list, which also exposes ``.ok`` and ``.indexes``. Without ``reject_bad_rows=True`` the previous all-or-nothing behavior is unchanged: constraint errors raise ``sqlite3.IntegrityError``.
+
+.. code-block:: python
+
+    rejects = db["dogs"].insert_all(records, reject_bad_rows=True)
+    if not rejects.ok:
+        for rejected in rejects:
+            print(rejected.index, rejected.error)
+
+The input is only traversed once. Each batch is first attempted as the usual bulk statement, and only a batch that raises an integrity error is split in half recursively, so a batch with no bad rows still costs a single bulk ``INSERT`` and a sparse batch of 64 rows with two bad rows costs 23 insert attempts instead of 64 row-at-a-time writes.
+
+When the same key appears more than once inside one batch the records are still processed in input order: for a plain insert the first occurrence is written and every later occurrence is rejected; for an upsert the existing upsert semantics apply, so the last occurrence wins and duplicate keys are not themselves rejected.
+
+Foreign key checks are deferred while a failed batch is being localized, which lets a row reference another row that appears later in the same batch; rejected foreign keys are then located with ``PRAGMA foreign_key_check`` and deleted before the chunk commits. Constraints are never switched off, and errors that are not row-level constraint failures - disk errors, lost connections or SQL construction errors such as writing into a generated column - still fail the entire operation.
+
 .. note::
     In the CLI: :ref:`sqlite-utils insert <cli_inserting_data>`
 

@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _v4_3:
+
+4.3 (unreleased)
+----------------
+
+- New ``reject_bad_rows=True`` option for ``table.insert_all()`` and ``table.upsert_all()``. In this explicit rejection mode, records that violate a unique, not-null, CHECK or foreign key constraint are skipped and returned as a list of ``RejectedRow`` objects - each with the record's zero-based input index, the record itself and the SQLite diagnostic - while every valid record is written. The default all-or-nothing behavior is unchanged. Batches are still written with bulk statements; only a batch that raises an integrity error is recursively split to localize the offending rows. See :ref:`python_api_reject_bad_rows`.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)
