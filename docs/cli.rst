@@ -2277,6 +2277,9 @@ Every option for this table (with the exception of ``--pk-none``) can be specifi
 ``--no-strict``
     Convert a strict table back to a regular non-strict table.
 
+``--preserve lenient|strict``
+    Defaults to ``lenient``, which keeps the historical behavior. Pass ``--preserve strict`` to analyze every index, trigger and view that depends on the table before making any destructive change: objects that can be migrated reliably are recreated against the new columns, while anything that cannot be migrated safely causes the command to fail with an explanation and leaves the database untouched - see :ref:`python_api_transform_strict_preservation`.
+
 If you want to see the SQL that will be executed to make the change without actually executing it, add the ``--sql`` flag. For example:
 
 .. code-block:: bash

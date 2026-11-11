@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from types import TracebackType
 from typing import (
     Any,
+    Literal,
     TypeVar,
     Union,
     cast,
@@ -39,6 +40,12 @@ from .create_table_parser import (
     parse_uniques,
     rewrite_check_expression,
     sql_ends_in_line_comment,
+)
+from .schema_preservation import (
+    PreservationError,
+    plan_index as strict_plan_index,
+    plan_trigger as strict_plan_trigger,
+    plan_view as strict_plan_view,
 )
 from .utils import (
     ANY,
@@ -324,6 +331,12 @@ Trigger = namedtuple("Trigger", ("name", "table", "sql"))
 
 class TransformError(Exception):
     pass
+
+
+# "lenient" preserves the historical transform() behaviour: objects that can
+# be migrated easily are kept, the rest raises TransformError. "strict" runs
+# the full schema preservation analysis before any destructive SQL.
+TransformPreserveMode = Literal["lenient", "strict"]
 
 
 # A single column name, or a tuple of columns for a compound foreign key
@@ -2655,6 +2668,7 @@ class Table(Queryable):
         column_order: list[str] | None = None,
         keep_table: str | None = None,
         strict: bool | None = None,
+        preserve: TransformPreserveMode = "lenient",
     ) -> "Table":
         """
         Apply an advanced alter table, including operations that are not supported by
@@ -2684,6 +2698,12 @@ class Table(Queryable):
           dropped
         :param strict: Set to ``True`` to make the table strict or ``False`` to make it
           non-strict. Defaults to ``None``, which preserves the existing strict mode.
+        :param preserve: ``"lenient"`` (the default) keeps the historical
+          behaviour. ``"strict"`` analyses every index, trigger and view that
+          depends on this table before any destructive SQL runs, migrates the
+          ones that can be migrated reliably and raises
+          :py:class:`sqlite_utils.schema_preservation.PreservationError` for
+          the rest - see :ref:`python_api_transform_strict_preservation`.
         """
         if not self.exists():
             raise ValueError("Cannot transform a table that doesn't exist yet")
@@ -2700,6 +2720,7 @@ class Table(Queryable):
             column_order=column_order,
             keep_table=keep_table,
             strict=strict,
+            preserve=preserve,
         )
         pragma_foreign_keys_was_on = bool(
             self.db.execute("PRAGMA foreign_keys").fetchone()[0]
@@ -2786,6 +2807,7 @@ class Table(Queryable):
         tmp_suffix: str | None = None,
         keep_table: str | None = None,
         strict: bool | None = None,
+        preserve: TransformPreserveMode = "lenient",
     ) -> list[str]:
         """
         Return a list of SQL statements that should be executed in order to apply this transformation.
@@ -2808,7 +2830,15 @@ class Table(Queryable):
           dropped
         :param strict: Set to ``True`` to make the table strict or ``False`` to make it
           non-strict. Defaults to ``None``, which preserves the existing strict mode.
+        :param preserve: ``"lenient"`` (the default) keeps the historical
+          behaviour; ``"strict"`` refuses to run when an index, trigger or
+          view cannot be migrated reliably - see
+          :ref:`python_api_transform_strict_preservation`.
         """
+        if preserve not in ("lenient", "strict"):
+            raise ValueError(
+                f"preserve must be 'lenient' or 'strict', not {preserve!r}"
+            )
         if strict is True and not self.db.supports_strict:
             raise TransformError("SQLite does not support STRICT tables")
         types = types or {}
@@ -3127,6 +3157,18 @@ class Table(Queryable):
             new_cols=", ".join(quote_identifier(col) for col in new_cols),
         )
         sqls.append(copy_sql)
+        strict_post_sqls: list[str] = []
+        if preserve == "strict":
+            # Strict preservation: analyse every index, trigger and view that
+            # depends on this table before any destructive SQL is generated.
+            # Objects that cannot be migrated reliably raise PreservationError
+            # here, so nothing destructive has happened yet.
+            strict_pre_sqls, strict_post_sqls = self._strict_preservation_sqls(
+                rename=rename,
+                drop=drop,
+                columns=set(existing_columns),
+            )
+            sqls.extend(strict_pre_sqls)
         # Capture indexes before the old table is changed. Simple indexes that
         # reference renamed columns are recreated from structured PRAGMA
         # metadata instead of editing their stored CREATE INDEX SQL.
@@ -3134,6 +3176,9 @@ class Table(Queryable):
         index_create_sqls = []
         xindexes_by_name = {index.name: index for index in self.xindexes}
         for index in self.indexes:
+            if preserve == "strict":
+                # Strict mode already planned every index above.
+                continue
             if index.origin == "pk":
                 continue
             index_sql = self.db.execute(
@@ -3251,7 +3296,114 @@ class Table(Queryable):
             )
         # Re-add existing indexes
         sqls.extend(index_create_sqls)
+        # Strict mode recreated the replacement table's triggers and views.
+        sqls.extend(strict_post_sqls)
         return sqls
+
+    def _strict_preservation_sqls(
+        self,
+        *,
+        rename: dict[str, str],
+        drop: set[str],
+        columns: set[str],
+    ) -> tuple[list[str], list[str]]:
+        """Build the SQL that preserves dependent objects in strict mode.
+
+        All analysis happens before any destructive statement is returned.
+        The first list runs while the original table still exists (drops and
+        rewritten view definitions), the second after the replacement table
+        has been renamed into place (indexes, triggers and the remaining
+        view definitions).
+        """
+        pre_sqls: list[str] = []
+        post_sqls: list[str] = []
+
+        # Analyse views first so trigger analysis knows which INSTEAD OF
+        # triggers sit on views over the transformed table.
+        dependent_views: set[str] = set()
+        view_actions: list[tuple[str, str]] = []
+        for view in self.db.views:
+            view_sql = view.schema
+            if view_sql is None:
+                raise PreservationError(
+                    "Cannot transform table while strict preservation is "
+                    f"enabled: view {view.name!r} has no definition in "
+                    "sqlite_schema, so it cannot be analysed."
+                )
+            touched, rewritten = strict_plan_view(
+                view.name, view_sql, self.name, columns, rename, drop
+            )
+            if touched:
+                dependent_views.add(fold_identifier_case(view.name))
+            if not touched or rewritten == view_sql:
+                continue
+            view_actions.append((view.name, rewritten))
+
+        # Explicit indexes (origin "c"): primary-key and UNIQUE-constraint
+        # indexes are recreated by the table definition itself.
+        for index in self.indexes:
+            if index.origin == "pk":
+                continue
+            row = self.db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (index.name,),
+            ).fetchone()
+            index_sql = row[0] if row else None
+            if index_sql is None:
+                if index.origin == "u":
+                    continue
+                raise PreservationError(
+                    f"Cannot transform table while strict preservation is "
+                    f"enabled: index {index.name!r} has no CREATE INDEX "
+                    "statement in sqlite_schema, so it cannot be migrated."
+                )
+            rewritten = strict_plan_index(
+                index.name, index_sql, self.name, columns, rename, drop
+            )
+            pre_sqls.append(
+                f"DROP INDEX IF EXISTS {quote_identifier(index.name)};"
+            )
+            post_sqls.append(rewritten)
+
+        # Triggers on this table are dropped together with the old table, but
+        # recreate them explicitly up front so name conflicts with keep_table
+        # backups are impossible. Triggers defined on other tables survive
+        # the rebuild, so only the ones that reference renamed or dropped
+        # columns need dropping and recreating.
+        for trigger in self.db.triggers:
+            if trigger.sql is None:
+                raise PreservationError(
+                    "Cannot transform table while strict preservation is "
+                    f"enabled: trigger {trigger.name!r} has no definition in "
+                    "sqlite_schema, so it cannot be migrated."
+                )
+            touched, rewritten = strict_plan_trigger(
+                trigger.name,
+                trigger.sql,
+                self.name,
+                columns,
+                rename,
+                drop,
+                dependent_views=dependent_views,
+            )
+            on_this_table = fold_identifier_case(
+                trigger.table
+            ) == fold_identifier_case(self.name)
+            if not on_this_table and not touched:
+                continue
+            pre_sqls.append(
+                f"DROP TRIGGER IF EXISTS {quote_identifier(trigger.name)};"
+            )
+            post_sqls.append(rewritten)
+
+        # Views are stored as text and survive a table rebuild, so only the
+        # definitions that actually reference renamed or dropped columns need
+        # dropping and recreating.
+        for view_name, rewritten in view_actions:
+            pre_sqls.append(f"DROP VIEW {quote_identifier(view_name)};")
+            post_sqls.append(rewritten)
+
+        return pre_sqls, post_sqls
 
     def extract(
         self,

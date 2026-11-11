@@ -510,6 +510,9 @@ See :ref:`cli_transform_table`.
       --drop-foreign-key TEXT         Drop foreign key constraint for this column
       --strict / --no-strict          Enable or disable STRICT mode (default:
                                       preserve current mode)
+      --preserve [lenient|strict]     Strict mode analyses dependent indexes,
+                                      triggers and views before any destructive
+                                      change and refuses rather than dropping them
       --sql                           Output SQL without executing it
       --load-extension TEXT           Path to SQLite extension, with optional
                                       :entrypoint

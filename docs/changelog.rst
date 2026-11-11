@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _v4_3_0a0:
+
+4.3.0a0 (unreleased)
+--------------------
+
+- New strict preservation mode for ``table.transform()``: pass ``preserve="strict"`` (or ``sqlite-utils transform --preserve strict``) to analyse every index, trigger and view that depends on the table before any destructive SQL runs. Expression and partial indexes, quoted column names, composite constraints and trigger bodies are parsed at token level and migrated with the table; objects that cannot be migrated reliably - such as an index on a dropped column or a view whose column scope is ambiguous - raise ``sqlite_utils.schema_preservation.PreservationError`` with an explanation while the database is still in its original state. The default ``preserve="lenient"`` behaviour is unchanged. See :ref:`python_api_transform_strict_preservation`.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

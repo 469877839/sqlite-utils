@@ -2026,6 +2026,45 @@ A view that references a column which the transform renamed or dropped will rema
 
 To achieve this, the SQL produced by ``transform_sql()`` turns on ``PRAGMA legacy_alter_table`` for its ``ALTER TABLE ... RENAME TO`` statements, then restores the pragma to the value it had when the SQL was generated - without this, SQLite would attempt to rewrite references to the renamed table in every view definition, which fails when a view references the table that was just dropped.
 
+.. _python_api_transform_strict_preservation:
+
+Strict preservation of indexes, triggers and views
+--------------------------------------------------
+
+Because a transform rebuilds the table, SQLite drops every index and trigger attached to it, while dependent views keep pointing at the old column names stored in ``sqlite_schema``. The default, lenient behaviour preserves what can be reconstructed easily and raises ``TransformError`` for the rest - notably, triggers are not recreated at all, and a view left pointing at a renamed or dropped column will fail when it is next queried.
+
+Pass ``preserve="strict"`` to analyse every dependent object **before** any destructive SQL runs:
+
+.. code-block:: python
+
+    table.transform(rename={"headline": "title"}, preserve="strict")
+
+In strict mode, ``transform()`` parses the stored DDL with a token-level parser rather than text substitution, so string literals, quoted identifiers (including ``"full name"`` style column names), comments and collation names are never mistaken for column references:
+
+- **Indexes** - including expression indexes (``lower(name)``), partial indexes (``WHERE ...``), composite indexes, ``COLLATE`` and ``DESC`` clauses - are recreated with column references rewritten for renamed columns. An index that uses a dropped column cannot exist without that column, so the transform is refused.
+- **Triggers** - including ``UPDATE OF`` column lists, ``WHEN`` clauses, ``NEW.``/``OLD.`` references, composite statements and quoted names - are recreated with references to the transformed table rewritten. Triggers defined on *other* tables that write to the transformed table are analysed and migrated too. ``NEW.``/``OLD.`` references to a dropped column, references inside subqueries whose table scope cannot be determined reliably, and ``INSTEAD OF`` triggers on views over the transformed table whose column names change, all cause the transform to be refused.
+- **Views** - single-table views and views that qualify columns with the table name or an alias are rewritten for renamed columns. Views over joins or nested subqueries with unqualified references to a renamed or dropped column cannot be rewritten safely, so the transform is refused. Views that do not depend on the table are left byte-for-byte untouched.
+- **UNIQUE constraints** are still reproduced by the new ``CREATE TABLE`` statement, including composite constraints, names, collations and conflict clauses.
+
+Any object that cannot be migrated reliably raises ``sqlite_utils.schema_preservation.PreservationError`` with an explanation of the object and the reason. The check runs while the database is still in its original state - no table, index, trigger or view has been changed - and the whole transform runs inside a transaction, so a failure later in the rebuild rolls back to the original database as well. Nothing is silently dropped.
+
+.. code-block:: python
+
+    from sqlite_utils.schema_preservation import PreservationError
+
+    try:
+        table.transform(drop=["headline"], preserve="strict")
+    except PreservationError as ex:
+        print("Refusing to transform:", ex)
+
+The same option is available on ``transform_sql()`` and the CLI:
+
+.. code-block:: bash
+
+    sqlite-utils transform mydb.db mytable --rename headline title --preserve strict
+
+The historical behaviour is unchanged when ``preserve`` is not passed, so existing callers keep working.
+
 .. _python_api_transform_sql:
 
 Custom transformations with .transform_sql()

@@ -21,6 +21,7 @@ from click_default_group import DefaultGroup
 
 import sqlite_utils
 from sqlite_utils import recipes
+from sqlite_utils.schema_preservation import PreservationError
 from sqlite_utils.db import (
     DEFAULT,
     AlterError,
@@ -2724,6 +2725,13 @@ def schema(
     default=None,
     help="Enable or disable STRICT mode (default: preserve current mode)",
 )
+@click.option(
+    "--preserve",
+    type=click.Choice(["lenient", "strict"]),
+    default="lenient",
+    help="Strict mode analyses dependent indexes, triggers and views before "
+    "any destructive change and refuses rather than dropping them",
+)
 @click.option("--sql", is_flag=True, help="Output SQL without executing it")
 @load_extension_option
 def transform(
@@ -2742,6 +2750,7 @@ def transform(
     add_foreign_keys,
     drop_foreign_keys,
     strict,
+    preserve,
     sql,
     load_extension,
 ):
@@ -2792,33 +2801,38 @@ def transform(
         pk_value = None
 
     table_obj = db.table(table)
-    if sql:
-        for line in table_obj.transform_sql(
-            types=types,
-            drop=drop_set,
-            rename=rename_dict,
-            column_order=column_order_list,
-            not_null=not_null_dict,
-            pk=pk_value,
-            defaults=default_dict,
-            drop_foreign_keys=drop_foreign_keys_value,
-            add_foreign_keys=add_foreign_keys_value,
-            strict=strict,
-        ):
-            click.echo(line)
-    else:
-        table_obj.transform(
-            types=types,
-            drop=drop_set,
-            rename=rename_dict,
-            column_order=column_order_list,
-            not_null=not_null_dict,
-            pk=pk_value,
-            defaults=default_dict,
-            drop_foreign_keys=drop_foreign_keys_value,
-            add_foreign_keys=add_foreign_keys_value,
-            strict=strict,
-        )
+    try:
+        if sql:
+            for line in table_obj.transform_sql(
+                types=types,
+                drop=drop_set,
+                rename=rename_dict,
+                column_order=column_order_list,
+                not_null=not_null_dict,
+                pk=pk_value,
+                defaults=default_dict,
+                drop_foreign_keys=drop_foreign_keys_value,
+                add_foreign_keys=add_foreign_keys_value,
+                strict=strict,
+                preserve=preserve,
+            ):
+                click.echo(line)
+        else:
+            table_obj.transform(
+                types=types,
+                drop=drop_set,
+                rename=rename_dict,
+                column_order=column_order_list,
+                not_null=not_null_dict,
+                pk=pk_value,
+                defaults=default_dict,
+                drop_foreign_keys=drop_foreign_keys_value,
+                add_foreign_keys=add_foreign_keys_value,
+                strict=strict,
+                preserve=preserve,
+            )
+    except PreservationError as ex:
+        raise click.ClickException(str(ex))
 
 
 @cli.command()
