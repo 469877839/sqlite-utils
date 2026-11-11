@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _unreleased:
+
+Unreleased
+----------
+
+- New ``table.enable_rtree()``, ``table.rows_within_bbox()``, ``table.rebuild_rtree()``, ``table.detect_rtree()`` and ``table.disable_rtree()`` methods, plus ``sqlite-utils enable-rtree`` and ``sqlite-utils disable-rtree`` commands, for indexing existing bounding box columns with SQLite's built-in RTree module - no SpatiaLite required. The index is kept in sync by triggers, invalid rectangles are rejected, and queries can return raw candidates or exact results re-checked against the original column values. See :ref:`python_api_rtree`.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

@@ -27,6 +27,7 @@ from sqlite_utils.db import (
     BadMultiValues,
     DescIndex,
     InvalidColumns,
+    InvalidRectangle,
     NoTable,
     NoView,
     PrimaryKeyRequired,
@@ -3451,6 +3452,68 @@ def create_spatial_index(db_path, table, column_name, load_extension):
         )
 
     db.table(table).create_spatial_index(column_name)
+
+
+@cli.command(name="enable-rtree")
+@click.argument(
+    "path",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, allow_dash=False),
+    required=True,
+)
+@click.argument("table")
+@click.argument("column", nargs=-1, required=True)
+@click.option(
+    "--index-name",
+    help="Name for the RTree index table - defaults to rtree_<table>",
+)
+@click.option(
+    "--replace",
+    is_flag=True,
+    help="Replace the existing RTree index if it exists",
+)
+@load_extension_option
+def enable_rtree(path, table, column, index_name, replace, load_extension):
+    """Create an RTree spatial index on four bounding box columns
+
+    The columns must be (minx, maxx, miny, maxy) columns of the table. The
+    index is kept in sync with the table by triggers, and does not require
+    the SpatiaLite extension.
+
+    Example:
+
+    \b
+        sqlite-utils enable-rtree places.db places minx maxx miny maxy
+    """
+    db = sqlite_utils.Database(path)
+    _register_db_for_cleanup(db)
+    _load_extensions(db, load_extension)
+    try:
+        db.table(table).enable_rtree(column, index_name=index_name, replace=replace)
+    except (NoTable, InvalidColumns, InvalidRectangle, ValueError) as ex:
+        raise click.ClickException(str(ex))
+
+
+@cli.command(name="disable-rtree")
+@click.argument(
+    "path",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, allow_dash=False),
+    required=True,
+)
+@click.argument("table")
+@click.argument("index_name", required=False)
+@load_extension_option
+def disable_rtree(path, table, index_name, load_extension):
+    """Remove an RTree spatial index and its synchronization triggers
+
+    Example:
+
+    \b
+        sqlite-utils disable-rtree places.db places
+    """
+    db = sqlite_utils.Database(path)
+    _register_db_for_cleanup(db)
+    _load_extensions(db, load_extension)
+    db.table(table).disable_rtree(index_name=index_name)
 
 
 def _find_migration_files(migrations):

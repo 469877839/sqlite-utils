@@ -1629,6 +1629,57 @@ See :ref:`cli_spatialite_indexes`.
       -h, --help             Show this message and exit.
 
 
+.. _cli_ref_enable_rtree:
+
+enable-rtree
+============
+
+See :ref:`cli_rtree`.
+
+::
+
+    Usage: sqlite-utils enable-rtree [OPTIONS] PATH TABLE COLUMN...
+
+      Create an RTree spatial index on four bounding box columns
+
+      The columns must be (minx, maxx, miny, maxy) columns of the table. The index
+      is kept in sync with the table by triggers, and does not require the
+      SpatiaLite extension.
+
+      Example:
+
+          sqlite-utils enable-rtree places.db places minx maxx miny maxy
+
+    Options:
+      --index-name TEXT      Name for the RTree index table - defaults to
+                             rtree_<table>
+      --replace              Replace the existing RTree index if it exists
+      --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
+      -h, --help             Show this message and exit.
+
+
+.. _cli_ref_disable_rtree:
+
+disable-rtree
+=============
+
+See :ref:`cli_rtree`.
+
+::
+
+    Usage: sqlite-utils disable-rtree [OPTIONS] PATH TABLE [INDEX_NAME]
+
+      Remove an RTree spatial index and its synchronization triggers
+
+      Example:
+
+          sqlite-utils disable-rtree places.db places
+
+    Options:
+      --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
+      -h, --help             Show this message and exit.
+
+
 .. _cli_ref_plugins:
 
 plugins

@@ -3030,6 +3030,28 @@ See this `SpatiaLite Cookbook recipe <http://www.gaia-gis.it/gaia-sins/spatialit
 .. note::
     In Python: :ref:`table.create_spatial_index() <python_api_gis_create_spatial_index>`  CLI reference: :ref:`sqlite-utils create-spatial-index <cli_ref_create_spatial_index>`
 
+.. _cli_rtree:
+
+RTree spatial indexes
+---------------------
+
+Tables that already store geometry as four bounding box columns can use the RTree module built into SQLite, without loading SpatiaLite. Pass the four columns in ``(minx, maxx, miny, maxy)`` order:
+
+.. code-block:: bash
+
+    sqlite-utils enable-rtree places.db places minx maxx miny maxy
+
+This creates an RTree virtual table plus triggers that keep it synchronized on every insert, update and delete. Inverted rectangles, non-numeric or out-of-range coordinates are rejected on subsequent writes; rows with ``NULL`` coordinates are left out of the index. See :ref:`python_api_rtree` for the full semantics, including the difference between intersects and contains queries.
+
+Remove an index and its triggers with:
+
+.. code-block:: bash
+
+    sqlite-utils disable-rtree places.db places
+
+.. note::
+    In Python: :ref:`table.enable_rtree() <python_api_rtree>`  CLI reference: :ref:`sqlite-utils enable-rtree <cli_ref_enable_rtree>` and :ref:`sqlite-utils disable-rtree <cli_ref_disable_rtree>`
+
 .. _cli_install:
 
 Installing packages

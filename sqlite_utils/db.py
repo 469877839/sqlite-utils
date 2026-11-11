@@ -6,6 +6,7 @@ import importlib
 import inspect
 import itertools
 import json
+import math
 import os
 import pathlib
 import re
@@ -464,6 +465,80 @@ class InvalidColumns(Exception):
     "Specified columns do not exist"
 
 
+class InvalidRectangle(Exception):
+    "Bounding box contains NULL, NaN or inverted (min > max) coordinates"
+
+
+# SQLite RTree stores coordinates as 32-bit floats, rounding each minimum
+# down and each maximum up. Within these limits that rounding guarantees the
+# stored box contains the original 64-bit rectangle, so an RTree lookup is a
+# superset of the true result. Outside them the rounding stops guaranteeing
+# containment (tiny non-zero values collapse to 0.0 and large ones to
+# infinity), so out-of-range coordinates are rejected rather than silently
+# producing an index that can miss real matches.
+_RTREE_MAX_COORDINATE = 3.4028234663852886e38
+_RTREE_MIN_COORDINATE = 1.1754943508222875e-38
+
+
+def _validate_coordinate(value: object, description: str) -> float:
+    """
+    Validate a single RTree coordinate, returning it as a float.
+
+    Rejects ``None`` (RTree would silently coerce it to ``0.0``), ``NaN``
+    (likewise) and values outside the 32-bit float range where RTree's
+    rounding can no longer guarantee that the stored box contains the value.
+    """
+    if value is None:
+        raise InvalidRectangle(f"{description} cannot be None")
+    if not isinstance(value, (int, float)):
+        raise InvalidRectangle(
+            f"{description} must be a number, got {value!r}"
+        )
+    if isinstance(value, float) and math.isnan(value):
+        raise InvalidRectangle(f"{description} cannot be NaN")
+    if value > _RTREE_MAX_COORDINATE or value < -_RTREE_MAX_COORDINATE:
+        raise InvalidRectangle(
+            f"{description} {value!r} is outside the 32-bit float range "
+            f"supported by SQLite RTree "
+            f"(+/-{_RTREE_MAX_COORDINATE!r})"
+        )
+    if 0.0 < value < _RTREE_MIN_COORDINATE:
+        raise InvalidRectangle(
+            f"{description} {value!r} is too small in magnitude for SQLite "
+            f"RTree, which requires 0 or at least +/-{_RTREE_MIN_COORDINATE!r}"
+        )
+    if -_RTREE_MIN_COORDINATE < value < 0.0:
+        raise InvalidRectangle(
+            f"{description} {value!r} is too small in magnitude for SQLite "
+            f"RTree, which requires 0 or at least +/-{_RTREE_MIN_COORDINATE!r}"
+        )
+    return float(value)
+
+
+def _validate_bbox(bounds: Sequence) -> tuple[float, float, float, float]:
+    """
+    Validate a ``(minx, maxx, miny, maxy)`` bounding box, returning it as floats.
+
+    Raises :py:class:`InvalidRectangle` for ``None`` and ``NaN`` coordinates
+    (SQLite RTree would silently coerce both to ``0.0``), for coordinates
+    outside the 32-bit float range, and for inverted rectangles where a
+    minimum exceeds its maximum.
+    """
+    if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+        raise InvalidRectangle(
+            f"Bounding box must be a (minx, maxx, miny, maxy) sequence, got {bounds!r}"
+        )
+    minx, maxx, miny, maxy = (
+        _validate_coordinate(value, f"Bounding box {name}")
+        for name, value in zip(("minx", "maxx", "miny", "maxy"), bounds)
+    )
+    if minx > maxx or miny > maxy:
+        raise InvalidRectangle(
+            f"Bounding box minimum cannot exceed maximum, got {bounds!r}"
+        )
+    return (minx, maxx, miny, maxy)
+
+
 class TransactionError(Exception):
     "Operation cannot be performed while a transaction is open"
 
@@ -483,6 +558,16 @@ _COUNTS_TABLE_CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS "{}"(
    "table" TEXT PRIMARY KEY,
    count INTEGER DEFAULT 0
+);
+""".strip()
+
+
+_RTREE_META_TABLE_NAME = "_rtree_columns"
+_RTREE_META_CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS "{}"(
+   "index_name" TEXT PRIMARY KEY,
+   "table_name" TEXT NOT NULL,
+   "columns" TEXT NOT NULL
 );
 """.strip()
 
@@ -5473,6 +5558,473 @@ class Table(Queryable):
         )
         result = cursor.fetchone()
         return result and bool(result[0])
+
+    def enable_rtree(
+        self,
+        columns: Iterable[str],
+        index_name: str | None = None,
+        replace: bool = False,
+    ) -> "Table":
+        """
+        Create an RTree spatial index against four existing numeric columns of
+        this table, using the ``rtree`` virtual table module built into SQLite -
+        no SpatiaLite extension is required.
+
+        ``columns`` must be ``(minx_column, maxx_column, miny_column, maxy_column)``
+        naming existing columns that hold the bounding box of each row. The
+        columns themselves are never modified - the index lives in a separate
+        virtual table (default name ``rtree_<table>``) plus triggers that keep
+        it synchronized on every subsequent insert, update or delete.
+
+        Rows where any of the four columns is ``NULL`` are not indexed.
+        Inverted (min > max) values and coordinates outside the 32-bit float
+        range used by SQLite RTree are rejected with
+        :py:class:`InvalidRectangle` - at index creation for existing data,
+        and via triggers on every later write - because RTree would otherwise
+        reject the write or silently coerce the value (``NULL`` becomes
+        ``0.0``; very large values become infinity). ``NaN`` cannot be bound
+        through Python's ``sqlite3`` module, which stores it as ``NULL``, so
+        it takes the NULL path rather than being indexed at ``0.0``.
+
+        See :ref:`python_api_rtree` for more details.
+
+        .. code-block:: python
+
+            db["places"].enable_rtree(["minx", "maxx", "miny", "maxy"])
+
+        :param columns: The four bounding box columns to index
+        :param index_name: Name for the RTree virtual table - defaults to
+          ``rtree_<table>``
+        :param replace: Drop and recreate the index if it already exists
+        """
+        if not self.exists():
+            raise NoTable(f"Table {self.name} does not exist")
+        if isinstance(columns, str):
+            columns = [columns]
+        columns = [resolve_casing(c, self.columns_dict) for c in columns]
+        if len(columns) != 4:
+            raise InvalidColumns(
+                "RTree indexes require exactly 4 columns "
+                f"(minx, maxx, miny, maxy), got {columns}"
+            )
+        if not set(columns).issubset(self.columns_dict.keys()):
+            raise InvalidColumns(
+                f"Invalid columns {columns} for table with columns {list(self.columns_dict.keys())}"
+            )
+        column_types = self.columns_dict
+        non_numeric = [c for c in columns if column_types[c] not in (int, float)]
+        if non_numeric:
+            raise InvalidColumns(
+                f"RTree columns must be numeric (integer or real), but {non_numeric} "
+                f"have types {[str(column_types[c].__name__) for c in non_numeric]}"
+            )
+        if re.search(r"without\s+rowid\s*$", self.schema.strip(), re.IGNORECASE):
+            raise ValueError(
+                f"Cannot create an RTree index on table {self.name} because it "
+                "is a WITHOUT ROWID table - RTree indexes are keyed by rowid"
+            )
+        if index_name is None:
+            index_name = f"rtree_{self.name}"
+        if self.db[index_name].exists():
+            if not replace:
+                return self
+            self.disable_rtree(index_name=index_name)
+        with self.db.atomic():
+            self._create_rtree_table(index_name)
+            self._store_rtree_columns(index_name, columns)
+            self._populate_rtree(index_name, columns)
+            self._create_rtree_triggers(index_name, columns)
+        return self
+
+    def _create_rtree_table(self, index_name: str) -> None:
+        "Create the ``rtree`` virtual table that backs an RTree index."
+        self.db.execute(
+            "CREATE VIRTUAL TABLE {} USING rtree(id, minx, maxx, miny, maxy)".format(
+                quote_identifier(index_name)
+            )
+        )
+
+    def _store_rtree_columns(self, index_name: str, columns: Sequence[str]) -> None:
+        "Record which columns feed an RTree index, so it can be detected and rebuilt."
+        self.db.execute(_RTREE_META_CREATE_SQL.format(_RTREE_META_TABLE_NAME))
+        self.db.execute(
+            'INSERT OR REPLACE INTO "{}" (index_name, table_name, columns) '
+            "VALUES (?, ?, ?)".format(_RTREE_META_TABLE_NAME),
+            [index_name, self.name, json.dumps(list(columns))],
+        )
+
+    def _rtree_columns(self, index_name: str) -> list[str] | None:
+        "The four bounding box columns recorded for an RTree index, or ``None``."
+        if not self.db[_RTREE_META_TABLE_NAME].exists():
+            return None
+        row = self.db.execute(
+            'SELECT columns FROM "{}" WHERE index_name = ?'.format(
+                _RTREE_META_TABLE_NAME
+            ),
+            [index_name],
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def _rtree_trigger_sql(self, index_name: str, columns: Sequence[str]) -> str:
+        """
+        SQL that creates the triggers keeping an RTree index in sync with the
+        table, and rejecting values that RTree cannot index faithfully.
+
+        ``BEFORE`` triggers reject inverted rectangles and coordinates outside
+        the range where RTree's 32-bit rounding still guarantees containment,
+        using ``NEW`` - which holds every column value a row will have after
+        the insert or update, whether or not that column is being changed. A
+        ``NULL`` coordinate makes those comparisons unknown rather than true,
+        so rows without a full bounding box are accepted and simply skipped.
+
+        ``AFTER`` triggers maintain the index. An update deletes the old entry
+        and re-inserts the row, but only when the ``rowid`` or one of the four
+        coordinates actually changed - otherwise every unrelated update would
+        rewrite the same entry, or (with an unchanged ``rowid``) collide with
+        it. Including the ``rowid`` in that check means an update that moves a
+        row's ``rowid`` never leaves a stale entry behind. Rows whose
+        coordinates are not all non-NULL are removed from the index.
+        """
+        table = quote_identifier(self.name)
+        rtree_table = quote_identifier(index_name)
+        quoted_columns = [quote_identifier(c) for c in columns]
+        trigger_names = {
+            suffix: quote_identifier(f"{index_name}{suffix}")
+            for suffix in ("_bi", "_bu", "_ai", "_au", "_ad")
+        }
+        new_columns = ", ".join(f"NEW.{c}" for c in quoted_columns)
+        non_null = " AND ".join(f"NEW.{c} IS NOT NULL" for c in quoted_columns)
+
+        def _invalid_sql(values: Sequence[str]) -> str:
+            # Rejects inverted rectangles and values outside the range where
+            # RTree's 32-bit rounding still contains the original value.
+            conditions = [
+                f"{values[0]} > {values[1]}",
+                f"{values[2]} > {values[3]}",
+            ]
+            for value in values:
+                conditions.extend(
+                    (
+                        f"{value} > {_RTREE_MAX_COORDINATE!r}",
+                        f"{value} < -{_RTREE_MAX_COORDINATE!r}",
+                        f"({value} > 0.0 AND {value} < {_RTREE_MIN_COORDINATE!r})",
+                        f"({value} < 0.0 AND {value} > -{_RTREE_MIN_COORDINATE!r})",
+                    )
+                )
+            return " OR ".join(conditions)
+
+        insert_invalid = _invalid_sql([f"NEW.{c}" for c in quoted_columns])
+        update_invalid = insert_invalid
+        # Did the rowid or any coordinate change? Includes NEW/OLD rowid so
+        # that a rowid rewrite still moves the index entry.
+        changed = "NOT ({})".format(
+            " AND ".join(
+                [f"OLD.rowid IS NEW.rowid"]
+                + [f"OLD.{c} IS NEW.{c}" for c in quoted_columns]
+            )
+        )
+        insert_values = (
+            "INSERT INTO {rtree} (id, minx, maxx, miny, maxy) "
+            "SELECT NEW.rowid, {new_columns} WHERE {non_null}"
+        ).format(rtree=rtree_table, new_columns=new_columns, non_null=non_null)
+        return textwrap.dedent("""
+            CREATE TRIGGER {bi} BEFORE INSERT ON {table}
+            WHEN {insert_invalid}
+            BEGIN
+              SELECT RAISE(ABORT, 'invalid rectangle for RTree index {index_name}');
+            END;
+            CREATE TRIGGER {bu} BEFORE UPDATE ON {table}
+            WHEN {update_invalid}
+            BEGIN
+              SELECT RAISE(ABORT, 'invalid rectangle for RTree index {index_name}');
+            END;
+            CREATE TRIGGER {ad} AFTER DELETE ON {table} BEGIN
+              DELETE FROM {rtree} WHERE id = OLD.rowid;
+            END;
+            CREATE TRIGGER {ai} AFTER INSERT ON {table} BEGIN
+              {insert_values};
+            END;
+            CREATE TRIGGER {au} AFTER UPDATE ON {table} BEGIN
+              DELETE FROM {rtree} WHERE id = OLD.rowid AND {changed};
+              {insert_values} AND {changed};
+            END;
+        """).strip().format(
+            bi=trigger_names["_bi"],
+            bu=trigger_names["_bu"],
+            ad=trigger_names["_ad"],
+            ai=trigger_names["_ai"],
+            au=trigger_names["_au"],
+            table=table,
+            rtree=rtree_table,
+            index_name=index_name,
+            insert_invalid=insert_invalid,
+            update_invalid=update_invalid,
+            insert_values=insert_values,
+            changed=changed,
+        )
+
+    def _create_rtree_triggers(self, index_name: str, columns: Sequence[str]) -> None:
+        "Create (or replace) the triggers that keep an RTree index in sync."
+        self._drop_rtree_triggers(index_name)
+        self.db.executescript(self._rtree_trigger_sql(index_name, columns))
+
+    def _drop_rtree_triggers(self, index_name: str) -> None:
+        "Drop the triggers that keep an RTree index in sync, if they exist."
+        for suffix in ("_bi", "_bu", "_ai", "_au", "_ad"):
+            self.db.execute(
+                "DROP TRIGGER IF EXISTS {}".format(
+                    quote_identifier(f"{index_name}{suffix}")
+                )
+            )
+
+    def _populate_rtree(self, index_name: str, columns: Sequence[str]) -> int:
+        """
+        (Re)populate an RTree index from the current rows of this table,
+        validating every value first. Returns the number of indexed rows.
+
+        Rows with any ``NULL`` coordinate are skipped, matching the triggers -
+        SQLite RTree would otherwise silently index them at ``0.0``.
+        """
+        quoted_columns = [quote_identifier(c) for c in columns]
+        rows = self.db.execute(
+            "SELECT rowid, {} FROM {}".format(
+                ", ".join(quoted_columns), quote_identifier(self.name)
+            )
+        ).fetchall()
+        entries = []
+        for row in rows:
+            rowid, values = row[0], row[1:]
+            if any(value is None for value in values):
+                continue
+            coordinates = [
+                _validate_coordinate(
+                    value, f"Row {rowid} column {column}"
+                )
+                for column, value in zip(columns, values)
+            ]
+            minx, maxx, miny, maxy = coordinates
+            if minx > maxx or miny > maxy:
+                raise InvalidRectangle(
+                    f"Row {rowid} has an inverted rectangle: "
+                    f"({minx}, {maxx}, {miny}, {maxy})"
+                )
+            entries.append((rowid, minx, maxx, miny, maxy))
+        self.db.execute(
+            "DELETE FROM {}".format(quote_identifier(index_name))
+        )
+        if entries:
+            self.db.conn.executemany(
+                "INSERT INTO {} (id, minx, maxx, miny, maxy) "
+                "VALUES (?, ?, ?, ?, ?)".format(quote_identifier(index_name)),
+                entries,
+            )
+        return len(entries)
+
+    def disable_rtree(self, index_name: str | None = None) -> "Table":
+        """
+        Remove an RTree index created by :meth:`enable_rtree`, including its
+        synchronization triggers. Does nothing if the index does not exist.
+
+        :param index_name: Name of the RTree index - defaults to ``rtree_<table>``
+        """
+        if index_name is None:
+            index_name = f"rtree_{self.name}"
+        if not self.db[index_name].exists():
+            return self
+        self._drop_rtree_triggers(index_name)
+        self.db.execute(
+            "DROP TABLE {}".format(quote_identifier(index_name))
+        )
+        if self.db[_RTREE_META_TABLE_NAME].exists():
+            self.db.execute(
+                'DELETE FROM "{}" WHERE index_name = ?'.format(
+                    _RTREE_META_TABLE_NAME
+                ),
+                [index_name],
+            )
+        return self
+
+    def detect_rtree(self) -> list[str]:
+        """
+        Names of the RTree indexes that have been created against this table
+        using :meth:`enable_rtree`.
+        """
+        if not self.db[_RTREE_META_TABLE_NAME].exists():
+            return []
+        return [
+            row[0]
+            for row in self.db.execute(
+                'SELECT index_name FROM "{}" WHERE table_name = ?'.format(
+                    _RTREE_META_TABLE_NAME
+                ),
+                [self.name],
+            ).fetchall()
+        ]
+
+    def rebuild_rtree(self, index_name: str | None = None) -> "Table":
+        """
+        Reindex every row of this table from scratch, and recreate the
+        synchronization triggers if they are missing.
+
+        This is useful after an operation that rebuilt or replaced the table
+        itself - ``transform()``, for example, drops the triggers along with
+        the old table, leaving the index populated but no longer updated.
+
+        :param index_name: Name of the RTree index - defaults to ``rtree_<table>``
+        """
+        if index_name is None:
+            index_name = f"rtree_{self.name}"
+        columns = self._rtree_columns(index_name)
+        if columns is None:
+            raise ValueError(
+                f"No RTree index {index_name!r} is registered for table "
+                f"{self.name!r}; call enable_rtree() first"
+            )
+        with self.db.atomic():
+            if self.db[index_name].exists():
+                if self.db[index_name].virtual_table_using != "RTREE":
+                    raise ValueError(
+                        f"Table {index_name!r} exists but is not an RTree index"
+                    )
+            else:
+                self._create_rtree_table(index_name)
+            self._populate_rtree(index_name, columns)
+            self._create_rtree_triggers(index_name, columns)
+        return self
+
+    def rows_within_bbox(
+        self,
+        bounds: Sequence,
+        mode: str = "intersects",
+        index_name: str | None = None,
+        exact: bool = True,
+        select: str = "*",
+        order_by: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> Generator[dict[str, Any], None, None]:
+        """
+        Yield rows whose bounding box meets a query rectangle.
+
+        ``bounds`` is ``(minx, maxx, miny, maxy)`` and ``mode`` selects the
+        matching rule:
+
+        ``intersects`` (the default)
+            The row's box shares at least one point with the query, touching
+            edges included: ``row_minx <= query_maxx AND row_maxx >= query_minx``
+            on both axes. This includes rows that merely touch the boundary,
+            and rows entirely inside the query.
+        ``contains``
+            The row's box encloses the whole query rectangle, touching edges
+            included: ``row_minx <= query_minx AND row_maxx >= query_maxx`` on
+            both axes. A row entirely *inside* the query does not match; a row
+            that merely touches it from outside does, because the shared edge
+            is contained.
+
+        Both tests are closed (``<=``/``>=``) on every edge, which is what makes
+        zero-area rectangles and negative coordinates behave: a point at
+        exactly ``x = 10`` intersects a query whose ``minx`` is ``10``, and a
+        zero-area row contained in the query intersects it too.
+
+        Rows with any ``NULL`` coordinate are never returned, in either mode -
+        SQL does not consider a ``NULL`` comparison true.
+
+        SQLite RTree stores 32-bit floats, rounding each minimum down and each
+        maximum up, so the index is a *superset*: it may return candidates that
+        do not match, but it will not omit a row that does. With ``exact=True``
+        (the default) the candidate list is re-checked against the original
+        column values with the same rule, in the same query, so the results
+        are exact. ``exact=False`` returns the raw candidate set, which is
+        usually faster and always contains every true match.
+
+        See :ref:`python_api_rtree` for more details.
+
+        .. code-block:: python
+
+            # Rows intersecting this box, with exact values
+            for row in table.rows_within_bbox((2.0, 4.0, 2.0, 4.0)):
+                print(row)
+
+            # Rows whose box contains this box
+            for row in table.rows_within_bbox((2.0, 4.0, 2.0, 4.0), mode="contains"):
+                print(row)
+
+        :param bounds: ``(minx, maxx, miny, maxy)`` query rectangle
+        :param mode: ``"intersects"`` or ``"contains"``
+        :param index_name: RTree index to use - defaults to ``rtree_<table>``
+        :param exact: Re-check candidates against the original column values
+        :param select: Comma-separated columns to return - defaults to ``*``
+        :param order_by: Column or SQL fragment to order by
+        :param limit: Maximum number of rows to return
+        :param offset: Number of rows to skip
+        """
+        if mode not in ("intersects", "contains"):
+            raise ValueError(
+                f"mode must be 'intersects' or 'contains', got {mode!r}"
+            )
+        minx, maxx, miny, maxy = _validate_bbox(bounds)
+        if index_name is None:
+            index_name = f"rtree_{self.name}"
+        columns = self._rtree_columns(index_name)
+        if columns is None or not self.db[index_name].exists():
+            raise ValueError(
+                f"No RTree index {index_name!r} is registered for table "
+                f"{self.name!r}; call enable_rtree() first"
+            )
+        quoted_columns = [quote_identifier(c) for c in columns]
+        if mode == "intersects":
+            candidate = (
+                "minx <= :maxx AND maxx >= :minx "
+                "AND miny <= :maxy AND maxy >= :miny"
+            )
+            recheck = (
+                "{row_minx} <= :maxx AND {row_maxx} >= :minx "
+                "AND {row_miny} <= :maxy AND {row_maxy} >= :miny"
+            )
+        else:
+            candidate = (
+                "minx <= :minx AND maxx >= :maxx "
+                "AND miny <= :miny AND maxy >= :maxy"
+            )
+            recheck = (
+                "{row_minx} <= :minx AND {row_maxx} >= :maxx "
+                "AND {row_miny} <= :miny AND {row_maxy} >= :maxy"
+            )
+        recheck = recheck.format(
+            row_minx=quoted_columns[0],
+            row_maxx=quoted_columns[1],
+            row_miny=quoted_columns[2],
+            row_maxy=quoted_columns[3],
+        )
+        # Candidates come from the RTree (32-bit, outward-rounded); the exact
+        # re-check compares the original column values in the outer query
+        sql = (
+            "SELECT {select} FROM {table} "
+            "WHERE rowid IN (SELECT id FROM {rtree} WHERE {candidate})"
+        )
+        if exact:
+            sql += " AND ({recheck})"
+        if order_by is not None:
+            sql += " ORDER BY " + order_by
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        if offset is not None:
+            if limit is None:
+                sql += " LIMIT -1"
+            sql += f" OFFSET {int(offset)}"
+        sql = sql.format(
+            select=select,
+            table=quote_identifier(self.name),
+            rtree=quote_identifier(index_name),
+            candidate=candidate,
+            recheck=recheck,
+        )
+        cursor = self.db.execute(
+            sql, {"minx": minx, "maxx": maxx, "miny": miny, "maxy": maxy}
+        )
+        names = dedupe_keys(c[0] for c in cursor.description)
+        for row in cursor:
+            yield dict(zip(names, row))
 
 
 class View(Queryable):

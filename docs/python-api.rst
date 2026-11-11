@@ -3525,3 +3525,73 @@ Creating a spatial index
 
 .. note::
     In the CLI: :ref:`sqlite-utils create-spatial-index <cli_spatialite_indexes>`
+
+.. _python_api_rtree:
+
+RTree spatial indexes
+=====================
+
+If a table already stores its geometry as four numeric columns - the minimum and maximum X and Y coordinates of each row's bounding box - SQLite's built-in `rtree virtual table module <https://www.sqlite.org/rtree.html>`__ can index it directly. No SpatiaLite extension is required, and the indexed columns themselves are never modified.
+
+.. code-block:: python
+
+    db["places"].create(
+        {"id": int, "minx": float, "maxx": float, "miny": float, "maxy": float},
+        pk="id",
+    )
+    db["places"].enable_rtree(["minx", "maxx", "miny", "maxy"])
+
+This creates an ``rtree`` virtual table (``rtree_places`` by default) and triggers that keep it synchronized on every subsequent insert, update and delete. Rows where any of the four columns is ``NULL`` are simply not indexed. The mapping between an index and its columns is recorded in a small ``_rtree_columns`` table.
+
+.. note::
+    In the CLI: :ref:`sqlite-utils enable-rtree <cli_rtree>` and :ref:`sqlite-utils disable-rtree <cli_rtree>`
+
+What RTree stores, and what gets rejected
+-----------------------------------------
+
+SQLite RTree stores every coordinate as a 32-bit float, rounding each minimum down and each maximum up so that, within the range of values RTree can represent faithfully, the stored rectangle contains the original 64-bit value. Two consequences follow:
+
+* An RTree lookup is a **superset** of the true result: it can return candidates that do not match, but it will never omit a row that does. That is why :meth:`~sqlite_utils.db.Table.rows_within_bbox` re-checks every candidate against the original column values by default.
+* Values outside the range where that rounding still guarantees containment cannot be indexed faithfully. Coordinates above approximately ``3.4028234663852886e38`` in magnitude round to infinity, and non-zero values below approximately ``1.1754943508222875e-38`` round to ``0.0`` - in both cases the stored box no longer contains the value. These values, inverted rectangles (a minimum greater than its maximum) and non-numeric values raise ``sqlite_utils.db.InvalidRectangle`` at index creation, and (via triggers) on every later write. A ``NaN`` cannot be bound through Python's ``sqlite3`` module - it is stored as ``NULL``, so it takes the NULL path and is not indexed rather than being coerced to ``0.0`` by RTree.
+
+Zero-area rectangles (where a minimum and maximum are equal, including point-like rows) and negative coordinates are valid and fully supported.
+
+Intersects versus contains
+--------------------------
+
+:meth:`~sqlite_utils.db.Table.rows_within_bbox` accepts ``(minx, maxx, miny, maxy)`` and a ``mode`` argument. Every comparison is closed (``<=``/``>=``), so touching edges always match:
+
+* ``mode="intersects"`` (the default) matches a row when the two rectangles share at least one point. A row entirely inside the query matches, a row overlapping the edge matches, and a row touching it at exactly one edge or point also matches.
+* ``mode="contains"`` matches a row only when the row's rectangle encloses the whole query rectangle. A row entirely *inside* the query does not match; one that merely touches the query from outside does, because the shared edge is contained within both.
+
+Pass ``exact=False`` to skip the re-check against the original values and get the raw RTree candidate set - still a superset of every true match, and useful when you want to apply further filtering yourself.
+
+.. code-block:: python
+
+    # Rows sharing any point with the query, re-checked exactly
+    rows = table.rows_within_bbox((2.0, 4.0, 2.0, 4.0))
+
+    # Rows whose own rectangle encloses the whole query
+    rows = table.rows_within_bbox((2.0, 4.0, 2.0, 4.0), mode="contains")
+
+    # Raw RTree candidates, before the exact re-check
+    candidates = table.rows_within_bbox((2.0, 4.0, 2.0, 4.0), exact=False)
+
+Rows with a ``NULL`` coordinate are never returned in either mode.
+
+.. automethod:: sqlite_utils.db.Table.enable_rtree
+   :noindex:
+
+.. automethod:: sqlite_utils.db.Table.rows_within_bbox
+   :noindex:
+
+.. automethod:: sqlite_utils.db.Table.disable_rtree
+   :noindex:
+
+.. automethod:: sqlite_utils.db.Table.detect_rtree
+   :noindex:
+
+.. automethod:: sqlite_utils.db.Table.rebuild_rtree
+   :noindex:
+
+Operations that rebuild a table, such as :meth:`~sqlite_utils.db.Table.transform`, drop its triggers as part of the rebuild. The index entries themselves survive (the rowids are preserved), but updates stop being applied until :meth:`~sqlite_utils.db.Table.rebuild_rtree` recreates the triggers and re-populates the index.

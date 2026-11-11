@@ -77,6 +77,13 @@ sqlite_utils.db.ForeignKey
 
 .. autoclass:: sqlite_utils.db.ForeignKey
 
+.. _reference_db_other_invalid_rectangle:
+
+sqlite_utils.db.InvalidRectangle
+--------------------------------
+
+.. autoclass:: sqlite_utils.db.InvalidRectangle
+
 sqlite_utils.utils
 ==================
 
