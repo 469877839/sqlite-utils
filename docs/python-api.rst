@@ -3008,6 +3008,63 @@ This runs the following SQL::
 .. note::
     In the CLI: :ref:`sqlite-utils rebuild-fts <cli_fts>`
 
+.. _python_api_fts_health:
+
+Checking and repairing a full-text search table
+===============================================
+
+An FTS index can silently fall out of sync with its content table - for
+example if a synchronization trigger was dropped, or if rows were inserted,
+updated or deleted while the triggers were absent. Use
+``table.fts_health()`` for an offline consistency check that does not modify
+anything:
+
+.. code-block:: python
+
+    health = db.table("dogs").fts_health()
+    print(health.ok)  # True if the index matches the table
+
+The returned :py:class:`sqlite_utils.db.FtsHealth` object reports every
+problem it found:
+
+- ``missing_columns`` - indexed columns that no longer exist on the content
+  table, for example after they were renamed or dropped
+- ``missing_triggers`` - synchronization triggers (``dogs_ai``, ``dogs_ad``,
+  ``dogs_au``) that are absent even though other triggers for the index
+  exist
+- ``stale_triggers`` - synchronization triggers whose SQL no longer matches
+  the indexed columns
+- ``index_stale`` - ``True`` if the index content no longer matches the
+  content table, detected with the SQLite FTS ``integrity-check`` command
+
+Call ``health.problems`` for a list of human-readable descriptions.
+
+Use ``table.repair_fts()`` to apply the fixes: missing or stale
+synchronization triggers are recreated and an out-of-sync index is rebuilt:
+
+.. code-block:: python
+
+    actions = db.table("dogs").repair_fts()
+
+It returns the list of repair actions it applied. Pass ``dry_run=True`` to
+preview the plan without changing the database. Repairs only ever touch the
+triggers and index created by ``enable_fts()`` - tables, triggers and
+indexes you created yourself are never modified or dropped.
+
+If the index references columns that no longer exist on the table,
+``repair_fts()`` raises :py:class:`sqlite_utils.db.FtsError` instead of
+leaving a queryable-but-wrong index behind. Migrate the index explicitly:
+drop it with ``disable_fts()`` and re-create it against the new columns with
+``enable_fts()``.
+
+``table.transform()`` protects FTS indexes too: transforming a table keeps a
+valid index in sync by rebuilding it and recreating its synchronization
+triggers, and raises ``TransformError`` if the transformation would rename
+or drop an indexed column.
+
+.. note::
+    In the CLI: :ref:`sqlite-utils check-fts <cli_check_fts>`
+
 .. _python_api_fts_optimize:
 
 Optimizing a full-text search table

@@ -326,6 +326,111 @@ class TransformError(Exception):
     pass
 
 
+class FtsError(Exception):
+    "Full-text search index is invalid or inconsistent with its content table"
+
+
+@dataclass(frozen=True)
+class FtsHealth:
+    """
+    Result of :meth:`.Table.fts_health` - an offline consistency check of the
+    full-text search index for a table against its content table.
+
+    ``table``
+        The content table that was checked
+
+    ``fts_table``
+        The name of the associated FTS virtual table, or ``None`` if the table
+        has not been configured for full-text search
+
+    ``fts_version``
+        ``"FTS5"`` or ``"FTS4"``, or ``None`` if no FTS table was found
+
+    ``columns``
+        The columns indexed by the FTS table
+
+    ``missing_columns``
+        Indexed columns that no longer exist on the content table - for
+        example after ``transform()`` renamed or dropped them. The index
+        cannot be repaired by rebuilding while this is non-empty.
+
+    ``missing_triggers``
+        Names of synchronization triggers (``<table>_ai``, ``<table>_ad``,
+        ``<table>_au``) that are absent even though other triggers for this
+        index exist
+
+    ``stale_triggers``
+        Names of synchronization triggers whose SQL does not match the
+        triggers that ``enable_fts(create_triggers=True)`` would generate for
+        the current index columns
+
+    ``index_stale``
+        ``True`` if the FTS index content does not match the content table,
+        ``False`` if it matches, ``None`` if the check could not be performed
+        (for example because of missing columns)
+
+    ``index_error``
+        The error message reported by the SQLite ``integrity-check`` command,
+        if the index is stale
+    """
+
+    table: str
+    fts_table: str | None
+    fts_version: str | None = None
+    columns: tuple[str, ...] = ()
+    missing_columns: tuple[str, ...] = ()
+    missing_triggers: tuple[str, ...] = ()
+    stale_triggers: tuple[str, ...] = ()
+    index_stale: bool | None = None
+    index_error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        "``True`` if the FTS index is fully consistent with the content table."
+        return (
+            self.fts_table is not None
+            and not self.missing_columns
+            and not self.missing_triggers
+            and not self.stale_triggers
+            and self.index_stale is False
+        )
+
+    @property
+    def problems(self) -> list[str]:
+        "Human-readable descriptions of every detected problem."
+        problems = []
+        if self.fts_table is None:
+            problems.append(f"Table '{self.table}' has no FTS index")
+            return problems
+        if self.missing_columns:
+            problems.append(
+                "FTS index '{}' references columns no longer on '{}': {}".format(
+                    self.fts_table, self.table, ", ".join(self.missing_columns)
+                )
+            )
+        if self.missing_triggers:
+            problems.append(
+                "Missing synchronization triggers: {}".format(
+                    ", ".join(self.missing_triggers)
+                )
+            )
+        if self.stale_triggers:
+            problems.append(
+                "Synchronization triggers do not match the indexed columns: {}".format(
+                    ", ".join(self.stale_triggers)
+                )
+            )
+        if self.index_stale:
+            problems.append(
+                "FTS index '{}' is out of sync with table '{}'{}".format(
+                    self.fts_table,
+                    self.table,
+                    f": {self.index_error}" if self.index_error else "",
+                )
+            )
+        return problems
+
+
 # A single column name, or a tuple of columns for a compound foreign key
 ForeignKeyColumns = str | tuple[str, ...] | list[str]
 
@@ -2840,6 +2945,68 @@ class Table(Queryable):
         if column_order is not None:
             column_order = [resolve_casing(c, existing_columns) for c in column_order]
 
+        # If this table has an FTS index, the transformation must not leave
+        # the index queryable but inconsistent with the new table shape.
+        # Dropping or renaming an indexed column is refused - the index must
+        # be migrated explicitly. Otherwise the FTS synchronization triggers
+        # (which DROP TABLE removes) are recreated and the index is rebuilt
+        # at the end of the transformation, since rowids and values may have
+        # changed.
+        fts_table = self.detect_fts()
+        fts_columns: list[str] = []
+        fts_trigger_sqls: list[str] = []
+        if fts_table is not None:
+            fts_columns = [column.name for column in self.db[fts_table].columns]
+            drop_folded = {fold_identifier_case(column) for column in drop}
+            rename_folded = {
+                fold_identifier_case(column): new_name
+                for column, new_name in rename.items()
+            }
+            dropped_fts_columns = [
+                column
+                for column in fts_columns
+                if fold_identifier_case(column) in drop_folded
+            ]
+            renamed_fts_columns = [
+                column
+                for column in fts_columns
+                if fold_identifier_case(column) in rename_folded
+            ]
+            if dropped_fts_columns or renamed_fts_columns:
+                problems = []
+                if dropped_fts_columns:
+                    problems.append("drop " + ", ".join(dropped_fts_columns))
+                if renamed_fts_columns:
+                    problems.append(
+                        "rename "
+                        + ", ".join(
+                            f"{column} to {rename_folded[fold_identifier_case(column)]}"
+                            for column in renamed_fts_columns
+                        )
+                    )
+                raise TransformError(
+                    "Table '{table}' has a full-text search index '{fts_table}' "
+                    "on columns {columns} - this transformation would {problems}, "
+                    "leaving the index inconsistent. Migrate the index explicitly "
+                    "first: drop it with disable_fts(), apply the transformation, "
+                    "then re-create it with enable_fts() against the new columns. "
+                    "No changes have been applied to this table.".format(
+                        table=self.name,
+                        fts_table=fts_table,
+                        columns=fts_columns,
+                        problems=" and ".join(problems),
+                    )
+                )
+            # Recreate only the synchronization triggers that existed before
+            existing_trigger_names = set(self.triggers_dict.keys())
+            fts_trigger_sqls = [
+                sql
+                for name, sql in zip(
+                    self._fts_trigger_names(), self._fts_trigger_sqls(fts_columns)
+                )
+                if name in existing_trigger_names
+            ]
+
         try:
             existing_checks = self.checks
             existing_column_comments = parse_column_comments(self.schema)
@@ -3251,6 +3418,16 @@ class Table(Queryable):
             )
         # Re-add existing indexes
         sqls.extend(index_create_sqls)
+        if fts_table is not None:
+            # Rebuild the external content index so it reflects the new
+            # rowids and values, then restore the synchronization triggers
+            # that were removed when the old table was dropped
+            sqls.append(
+                "INSERT INTO {table}({table}) VALUES('rebuild');".format(
+                    table=quote_identifier(fts_table)
+                )
+            )
+            sqls.extend(fts_trigger_sqls)
         return sqls
 
     def extract(
@@ -3810,38 +3987,63 @@ class Table(Queryable):
         self.populate_fts(columns)
 
         if create_triggers:
-            old_cols = ", ".join(f"old.{quote_identifier(c)}" for c in columns)
-            new_cols = ", ".join(f"new.{quote_identifier(c)}" for c in columns)
-            columns_quoted = ", ".join(quote_identifier(c) for c in columns)
-            table = quote_identifier(self.name)
-            table_fts = quote_identifier(self.name + "_fts")
-            triggers = (
-                textwrap.dedent("""
+            self.db.executescript(self._fts_trigger_sql(columns))
+        return self
+
+    def _fts_trigger_names(self) -> tuple[str, str, str]:
+        "The three synchronization trigger names owned by ``enable_fts``."
+        return (self.name + "_ai", self.name + "_ad", self.name + "_au")
+
+    def _fts_trigger_sqls(self, columns: Iterable[str]) -> list[str]:
+        """
+        The three ``CREATE TRIGGER`` statements (without trailing semicolons)
+        used by ``enable_fts(create_triggers=True)`` for these index columns.
+        """
+        columns = list(columns)
+        old_cols = ", ".join(f"old.{quote_identifier(c)}" for c in columns)
+        new_cols = ", ".join(f"new.{quote_identifier(c)}" for c in columns)
+        columns_quoted = ", ".join(quote_identifier(c) for c in columns)
+        table = quote_identifier(self.name)
+        table_fts = quote_identifier(self.name + "_fts")
+        trigger_names = self._fts_trigger_names()
+        statements = [
+            textwrap.dedent("""
                 CREATE TRIGGER {table_ai} AFTER INSERT ON {table} BEGIN
                   INSERT INTO {table_fts} (rowid, {columns}) VALUES (new.rowid, {new_cols});
-                END;
+                END
+            """).strip(),
+            textwrap.dedent("""
                 CREATE TRIGGER {table_ad} AFTER DELETE ON {table} BEGIN
                   INSERT INTO {table_fts} ({table_fts}, rowid, {columns}) VALUES('delete', old.rowid, {old_cols});
-                END;
+                END
+            """).strip(),
+            textwrap.dedent("""
                 CREATE TRIGGER {table_au} AFTER UPDATE ON {table} BEGIN
                   INSERT INTO {table_fts} ({table_fts}, rowid, {columns}) VALUES('delete', old.rowid, {old_cols});
                   INSERT INTO {table_fts} (rowid, {columns}) VALUES (new.rowid, {new_cols});
-                END;
-            """)
-                .strip()
-                .format(
-                    table=table,
-                    table_fts=table_fts,
-                    table_ai=quote_identifier(self.name + "_ai"),
-                    table_ad=quote_identifier(self.name + "_ad"),
-                    table_au=quote_identifier(self.name + "_au"),
-                    columns=columns_quoted,
-                    old_cols=old_cols,
-                    new_cols=new_cols,
-                )
+                END
+            """).strip(),
+        ]
+        return [
+            statement.format(
+                table=table,
+                table_fts=table_fts,
+                table_ai=quote_identifier(trigger_names[0]),
+                table_ad=quote_identifier(trigger_names[1]),
+                table_au=quote_identifier(trigger_names[2]),
+                columns=columns_quoted,
+                old_cols=old_cols,
+                new_cols=new_cols,
             )
-            self.db.executescript(triggers)
-        return self
+            for statement in statements
+        ]
+
+    def _fts_trigger_sql(self, columns: Iterable[str]) -> str:
+        """
+        SQL that creates the ``_ai``/``_ad``/``_au`` synchronization triggers
+        used by ``enable_fts(create_triggers=True)`` for these index columns.
+        """
+        return ";\n".join(self._fts_trigger_sqls(columns)) + ";"
 
     def populate_fts(self, columns: Iterable[str]) -> "Table":
         """
@@ -3900,6 +4102,154 @@ class Table(Queryable):
                 )
             )
         return self
+
+    def _fts_integrity_check(self, fts_table: str, fts_version: str) -> str | None:
+        """
+        Run the SQLite ``integrity-check`` FTS command, comparing the index
+        against the content table. Returns ``None`` if the index is
+        consistent, otherwise the error message reported by SQLite.
+        """
+        fts_table_quoted = quote_identifier(fts_table)
+        try:
+            if fts_version == "FTS5":
+                # The second argument forces a comparison against the content
+                # table for external content FTS5 tables - without it only the
+                # internal consistency of the index itself is verified
+                self.db.execute(
+                    "INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1)".format(
+                        table=fts_table_quoted
+                    )
+                )
+            else:
+                self.db.execute(
+                    "INSERT INTO {table}({table}) VALUES('integrity-check')".format(
+                        table=fts_table_quoted
+                    )
+                )
+        except sqlite3.DatabaseError as ex:
+            return str(ex)
+        return None
+
+    def fts_health(self) -> FtsHealth:
+        """
+        Check that the full-text search index for this table is consistent
+        with the table itself, without modifying anything.
+
+        Returns a :class:`FtsHealth` report describing any problems found:
+        indexed columns that no longer exist on the table, missing or stale
+        synchronization triggers, and index content that no longer matches
+        the table (detected using the SQLite FTS ``integrity-check`` command).
+
+        Use :meth:`.Table.repair_fts` to fix the problems this reports.
+
+        See :ref:`python_api_fts_health` for more details.
+        """
+        fts_table = self.detect_fts()
+        if fts_table is None:
+            return FtsHealth(table=self.name, fts_table=None)
+        fts_version = self.db[fts_table].virtual_table_using or "FTS5"
+        columns = tuple(column.name for column in self.db[fts_table].columns)
+        table_columns = set(self.columns_dict.keys())
+        missing_columns = tuple(
+            column for column in columns if column not in table_columns
+        )
+        # Compare the synchronization triggers against the ones
+        # enable_fts(create_triggers=True) would generate for these columns
+        existing_triggers = self.triggers_dict
+        expected_sql = dict(
+            zip(self._fts_trigger_names(), self._fts_trigger_sqls(columns))
+        )
+        present = [name for name in expected_sql if name in existing_triggers]
+        missing_triggers: tuple[str, ...] = ()
+        if present:
+            # Some triggers exist, so synchronization was configured - any
+            # absent trigger breaks it
+            missing_triggers = tuple(
+                name for name in expected_sql if name not in existing_triggers
+            )
+        stale_triggers = tuple(
+            name
+            for name in present
+            if existing_triggers[name].strip().rstrip(";") != expected_sql[name]
+        )
+        index_stale: bool | None = None
+        index_error: str | None = None
+        if not missing_columns:
+            index_error = self._fts_integrity_check(fts_table, fts_version)
+            index_stale = index_error is not None
+        return FtsHealth(
+            table=self.name,
+            fts_table=fts_table,
+            fts_version=fts_version,
+            columns=columns,
+            missing_columns=missing_columns,
+            missing_triggers=missing_triggers,
+            stale_triggers=stale_triggers,
+            index_stale=index_stale,
+            index_error=index_error,
+        )
+
+    def repair_fts(self, dry_run: bool = False) -> list[str]:
+        """
+        Repair problems detected by :meth:`.Table.fts_health`, returning the
+        list of repair actions that were (or would be) applied.
+
+        Repairs are limited to objects owned by ``enable_fts()``: the
+        ``<table>_ai``/``<table>_ad``/``<table>_au`` triggers are recreated if
+        missing or stale, and the index is rebuilt if its content no longer
+        matches the table. Triggers, tables and indexes created by other
+        means are never modified or dropped.
+
+        Raises :py:class:`sqlite_utils.db.FtsError` if the table has no FTS
+        index, or if the index references columns that no longer exist on the
+        table - that situation cannot be repaired automatically. Drop the
+        index with ``disable_fts()`` and re-create it against the new columns
+        with ``enable_fts()`` instead.
+
+        :param dry_run: Return the repair actions without applying them
+        """
+        health = self.fts_health()
+        if health.fts_table is None:
+            raise FtsError(
+                f"Table '{self.name}' does not have a full-text search index"
+            )
+        if health.missing_columns:
+            raise FtsError(
+                "FTS index '{}' references columns no longer on table '{}': {}. "
+                "This cannot be repaired automatically - drop the index with "
+                "disable_fts() and re-create it with enable_fts() against the "
+                "new columns.".format(
+                    health.fts_table, self.name, ", ".join(health.missing_columns)
+                )
+            )
+        actions = []
+        if health.missing_triggers or health.stale_triggers:
+            actions.append(
+                "Recreate synchronization triggers: {}".format(
+                    ", ".join(health.missing_triggers + health.stale_triggers)
+                )
+            )
+        if health.index_stale:
+            actions.append(f"Rebuild FTS index '{health.fts_table}'")
+        if dry_run or not actions:
+            return actions
+        with self.db.atomic():
+            if health.missing_triggers or health.stale_triggers:
+                # Only ever drop the trigger names owned by enable_fts() -
+                # user-created triggers are left untouched
+                trigger_sqls = dict(
+                    zip(
+                        self._fts_trigger_names(),
+                        self._fts_trigger_sqls(health.columns),
+                    )
+                )
+                for name in health.stale_triggers:
+                    self.db.execute(f"DROP TRIGGER {quote_identifier(name)}")
+                for name in health.missing_triggers + health.stale_triggers:
+                    self.db.execute(trigger_sqls[name])
+            if health.index_stale:
+                self.rebuild_fts()
+        return actions
 
     def detect_fts(self) -> str | None:
         "Detect if table has a corresponding FTS virtual table and return it"

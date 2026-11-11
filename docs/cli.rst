@@ -2770,6 +2770,48 @@ You can rebuild every FTS table by running ``rebuild-fts`` without passing any t
 
     sqlite-utils rebuild-fts mydb.db
 
+.. _cli_check_fts:
+
+Checking and repairing FTS indexes
+----------------------------------
+
+An FTS index can silently fall out of sync with its table - for example if a
+synchronization trigger was dropped, or if rows were modified while the
+triggers were absent. Use ``check-fts`` to verify that an index still matches
+its table:
+
+.. code-block:: bash
+
+    sqlite-utils check-fts mydb.db documents
+
+This reports missing synchronization triggers and stale index content, and
+exits with a non-zero status if any problems are found. Run it without table
+names to check every table that has an FTS index:
+
+.. code-block:: bash
+
+    sqlite-utils check-fts mydb.db
+
+Pass ``--fix`` to repair the problems it finds - missing or stale
+synchronization triggers are recreated and out-of-sync indexes are rebuilt:
+
+.. code-block:: bash
+
+    sqlite-utils check-fts mydb.db --fix
+
+Repairs only ever touch the triggers and index created by ``enable-fts`` -
+tables, triggers and indexes you created yourself are left alone. If the
+index references columns that no longer exist on the table (for example
+after they were renamed or dropped) the problem is reported but not repaired
+automatically: drop the index with ``disable-fts`` and re-create it against
+the new columns with ``enable-fts``.
+
+Use ``--json`` to get the health report as JSON:
+
+.. code-block:: bash
+
+    sqlite-utils check-fts mydb.db --json
+
 .. note::
     In Python: :ref:`table.enable_fts() <python_api_fts_enable>`  CLI reference: :ref:`sqlite-utils enable-fts <cli_ref_enable_fts>`
 

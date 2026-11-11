@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+Unreleased
+----------
+
+- New ``table.fts_health()`` method runs an offline consistency check of a table's full-text search index, reporting missing or stale synchronization triggers, indexed columns that no longer exist on the table, and index content that has drifted from the table. A new :class:`sqlite_utils.db.FtsHealth` object describes the result, and ``table.repair_fts(dry_run=...)`` returns an explicit repair plan and, when not in dry-run mode, recreates the missing or stale ``enable_fts()`` triggers and rebuilds the out-of-sync index without touching any user-created objects. (:ref:`documentation <python_api_fts_health>`)
+- New ``sqlite-utils check-fts`` command checks one or every FTS index, exits non-zero when an index is inconsistent, supports ``--fix`` to repair problems and ``--json`` for machine-readable output.
+- ``table.transform()`` now keeps a valid full-text search index consistent across transformations by rebuilding the index and recreating its synchronization triggers, and raises ``TransformError`` if a transformation would rename or drop an indexed column - previously it left the index queryable but returning stale or wrong results.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

@@ -3,6 +3,7 @@ from unittest.mock import ANY
 import pytest
 
 from sqlite_utils import Database
+from sqlite_utils.db import FtsError, FtsHealth, TransformError
 from sqlite_utils.utils import sqlite3
 
 search_records = [
@@ -777,3 +778,242 @@ def test_enable_fts_cli_on_view_errors(tmpdir):
     result = CliRunner().invoke(cli_module.cli, ["enable-fts", db_path, "v", "text"])
     assert result.exit_code == 1
     assert result.output.strip() == "Error: Table v is actually a view"
+
+
+@pytest.mark.parametrize("fts_version", ("FTS4", "FTS5"))
+def test_fts_health_healthy(fresh_db, fts_version):
+    table = fresh_db.table("dogs")
+    table.insert_all(
+        [
+            {"id": 1, "name": "charlie brown", "breed": "pug"},
+            {"id": 2, "name": "cleo cat", "breed": "siamese"},
+        ],
+        pk="id",
+    )
+    table.enable_fts(["name", "breed"], fts_version=fts_version, create_triggers=True)
+    health = table.fts_health()
+    assert isinstance(health, FtsHealth)
+    assert health.ok
+    assert health.fts_table == "dogs_fts"
+    assert health.fts_version == fts_version
+    assert health.columns == ("name", "breed")
+    assert health.missing_columns == ()
+    assert health.missing_triggers == ()
+    assert health.stale_triggers == ()
+    assert health.index_stale is False
+    assert health.problems == []
+    # A healthy table needs no repairs
+    assert table.repair_fts() == []
+
+
+def test_fts_health_no_fts(fresh_db):
+    table = fresh_db.table("dogs")
+    table.insert({"id": 1, "name": "charlie"})
+    health = table.fts_health()
+    assert health.fts_table is None
+    assert not health.ok
+    assert health.problems == ["Table 'dogs' has no FTS index"]
+
+
+def test_repair_fts_no_fts_raises(fresh_db):
+    table = fresh_db.table("dogs")
+    table.insert({"id": 1, "name": "charlie"})
+    with pytest.raises(FtsError, match="does not have a full-text search index"):
+        table.repair_fts()
+
+
+@pytest.mark.parametrize("fts_version", ("FTS4", "FTS5"))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "update dogs set name = 'rex' where id = 1",
+        "delete from dogs where id = 2",
+        "insert into dogs (id, name, breed) values (3, 'fido', 'beagle')",
+    ),
+)
+def test_fts_health_detects_stale_index(fresh_db, fts_version, mutation):
+    table = fresh_db.table("dogs")
+    table.insert_all(
+        [
+            {"id": 1, "name": "charlie brown", "breed": "pug"},
+            {"id": 2, "name": "cleo cat", "breed": "siamese"},
+        ],
+        pk="id",
+    )
+    table.enable_fts(["name", "breed"], fts_version=fts_version, create_triggers=True)
+    # Remove the synchronization triggers, then mutate the table directly so
+    # the index drifts out of sync
+    for trigger in ("dogs_ai", "dogs_ad", "dogs_au"):
+        fresh_db.execute(f"DROP TRIGGER {trigger}")
+    fresh_db.execute(mutation)
+    health = table.fts_health()
+    assert not health.ok
+    assert health.index_stale is True
+    assert health.index_error
+    assert any("out of sync" in problem for problem in health.problems)
+    # Repair rebuilds the index
+    actions = table.repair_fts()
+    assert actions == ["Rebuild FTS index 'dogs_fts'"]
+    assert table.fts_health().ok
+
+
+def test_fts_health_detects_missing_trigger(fresh_db):
+    table = fresh_db.table("dogs")
+    table.insert_all([{"id": 1, "name": "charlie"}], pk="id")
+    table.enable_fts(["name"], create_triggers=True)
+    fresh_db.execute("DROP TRIGGER dogs_au")
+    health = table.fts_health()
+    assert not health.ok
+    assert health.missing_triggers == ("dogs_au",)
+    assert health.stale_triggers == ()
+    assert health.index_stale is False
+    assert health.problems == ["Missing synchronization triggers: dogs_au"]
+    actions = table.repair_fts()
+    assert actions == ["Recreate synchronization triggers: dogs_au"]
+    assert table.fts_health().ok
+    # The recreated trigger keeps the index in sync again
+    table.update(1, {"name": "rex"})
+    assert [row["id"] for row in table.search("rex")] == [1]
+    assert table.fts_health().ok
+
+
+def test_fts_health_detects_stale_trigger(fresh_db):
+    table = fresh_db.table("dogs")
+    table.insert_all([{"id": 1, "name": "charlie"}], pk="id")
+    table.enable_fts(["name"], create_triggers=True)
+    # Replace a synchronization trigger with a different definition
+    fresh_db.execute("DROP TRIGGER dogs_au")
+    fresh_db.execute("CREATE TRIGGER dogs_au AFTER UPDATE ON dogs BEGIN SELECT 1; END")
+    health = table.fts_health()
+    assert not health.ok
+    assert health.missing_triggers == ()
+    assert health.stale_triggers == ("dogs_au",)
+    actions = table.repair_fts()
+    assert actions == ["Recreate synchronization triggers: dogs_au"]
+    assert table.fts_health().ok
+    table.update(1, {"name": "rex"})
+    assert [row["id"] for row in table.search("rex")] == [1]
+
+
+def test_fts_health_no_triggers_is_not_an_error(fresh_db):
+    # A table populated manually with populate_fts() and no triggers is a
+    # valid configuration - nothing is reported missing
+    table = fresh_db.table("dogs")
+    table.insert_all([{"id": 1, "name": "charlie"}], pk="id")
+    table.enable_fts(["name"])
+    health = table.fts_health()
+    assert health.ok
+    assert health.missing_triggers == ()
+
+
+def test_repair_fts_dry_run(fresh_db):
+    table = fresh_db.table("dogs")
+    table.insert_all([{"id": 1, "name": "charlie"}], pk="id")
+    table.enable_fts(["name"], create_triggers=True)
+    fresh_db.execute("DROP TRIGGER dogs_au")
+    actions = table.repair_fts(dry_run=True)
+    assert actions == ["Recreate synchronization triggers: dogs_au"]
+    # Nothing was changed
+    assert "dogs_au" not in table.triggers_dict
+    assert not table.fts_health().ok
+
+
+def test_repair_fts_preserves_user_objects(fresh_db):
+    table = fresh_db.table("dogs")
+    table.insert_all([{"id": 1, "name": "charlie", "breed": "pug"}], pk="id")
+    table.enable_fts(["name"], create_triggers=True)
+    fresh_db.execute(
+        "CREATE TRIGGER user_trigger AFTER INSERT ON dogs BEGIN SELECT 1; END"
+    )
+    table.create_index(["breed"])
+    fresh_db.execute("DROP TRIGGER dogs_au")
+    table.repair_fts()
+    # User-created trigger and index are untouched
+    assert "user_trigger" in table.triggers_dict
+    assert any(index.name == "idx_dogs_breed" for index in table.indexes)
+    assert table.fts_health().ok
+
+
+def test_repair_fts_missing_columns_raises(fresh_db):
+    table = fresh_db.table("dogs")
+    table.insert_all([{"id": 1, "name": "charlie"}], pk="id")
+    table.enable_fts(["name"], create_triggers=True)
+    # Rename the indexed column behind the back of the FTS index
+    fresh_db.execute("ALTER TABLE dogs RENAME COLUMN name TO dog_name")
+    health = table.fts_health()
+    assert not health.ok
+    assert health.missing_columns == ("name",)
+    # The integrity check cannot run against a missing column
+    assert health.index_stale is None
+    with pytest.raises(FtsError, match="no longer on table 'dogs'"):
+        table.repair_fts()
+    # The broken index is left in place for an explicit migration
+    assert table.detect_fts() == "dogs_fts"
+    # Explicit migration path: disable, then re-enable against the new column
+    table.disable_fts()
+    table.enable_fts(["dog_name"], create_triggers=True)
+    assert table.fts_health().ok
+    assert [row["id"] for row in table.search("charlie")] == [1]
+
+
+def test_transform_keeps_fts_index_consistent(fresh_db):
+    table = fresh_db.table("dogs")
+    table.insert_all(
+        [
+            {"id": 10, "name": "charlie brown", "breed": "pug"},
+            {"id": 20, "name": "cleo cat", "breed": "siamese"},
+        ],
+        pk="id",
+    )
+    table.enable_fts(["name", "breed"], create_triggers=True)
+    # Replacing the primary key used to silently drop the triggers and leave
+    # the index pointing at stale rowids
+    table.transform(pk="id", types={"breed": str})
+    assert set(table.triggers_dict) == {"dogs_ai", "dogs_ad", "dogs_au"}
+    assert table.fts_health().ok
+    assert [row["id"] for row in table.search("charlie")] == [10]
+    # Updates, deletes and inserts are still synchronized
+    table.update(10, {"name": "rex"})
+    table.delete(20)
+    table.insert({"id": 30, "name": "fido", "breed": "beagle"})
+    assert [row["id"] for row in table.search("rex")] == [10]
+    assert list(table.search("cleo")) == []
+    assert [row["id"] for row in table.search("fido")] == [30]
+    assert table.fts_health().ok
+
+
+def test_transform_rebuilds_fts_index_without_triggers(fresh_db):
+    table = fresh_db.table("dogs")
+    table.insert_all([{"id": 10, "name": "charlie"}], pk="id")
+    table.enable_fts(["name"])
+    table.transform(types={"name": str})
+    assert table.triggers_dict == {}
+    assert table.fts_health().ok
+    assert [row["id"] for row in table.search("charlie")] == [10]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"rename": {"name": "dog_name"}},
+        {"drop": ["name"]},
+    ),
+)
+def test_transform_refuses_fts_column_changes(fresh_db, kwargs):
+    table = fresh_db.table("dogs")
+    table.insert_all([{"id": 1, "name": "charlie", "breed": "pug"}], pk="id")
+    table.enable_fts(["name"], create_triggers=True)
+    with pytest.raises(TransformError, match="full-text search index"):
+        table.transform(**kwargs)
+    # Nothing was changed - the index is not left queryable but wrong
+    assert "name" in table.columns_dict
+    assert table.fts_health().ok
+    assert [row["id"] for row in table.search("charlie")] == [1]
+
+
+def test_transform_fts_column_change_error_mentions_migration(fresh_db):
+    table = fresh_db.table("dogs")
+    table.insert_all([{"id": 1, "name": "charlie"}], pk="id")
+    table.enable_fts(["name"])
+    with pytest.raises(TransformError, match="disable_fts"):
+        table.transform(rename={"name": "dog_name"})

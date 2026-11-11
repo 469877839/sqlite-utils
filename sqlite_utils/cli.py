@@ -26,6 +26,7 @@ from sqlite_utils.db import (
     AlterError,
     BadMultiValues,
     DescIndex,
+    FtsError,
     InvalidColumns,
     NoTable,
     NoView,
@@ -832,6 +833,94 @@ def disable_fts(path, table, load_extension):
     _register_db_for_cleanup(db)
     _load_extensions(db, load_extension)
     db.table(table).disable_fts()
+
+
+@cli.command(name="check-fts")
+@click.argument(
+    "path",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, allow_dash=False),
+    required=True,
+)
+@click.argument("tables", nargs=-1)
+@click.option(
+    "--fix",
+    help="Repair any problems that are found",
+    default=False,
+    is_flag=True,
+)
+@click.option(
+    "--json",
+    "json_output",
+    help="Output the health report as JSON",
+    default=False,
+    is_flag=True,
+)
+@load_extension_option
+def check_fts(path, tables, fix, json_output, load_extension):
+    """Check full-text search indexes are consistent with their tables
+
+    Reports missing synchronization triggers and stale index content.
+    Exits with a non-zero status if any table fails the check.
+
+    Example:
+
+    \b
+        sqlite-utils check-fts chickens.db chickens
+
+    Check every table with an FTS index, repairing any problems:
+
+    \b
+        sqlite-utils check-fts chickens.db --fix
+    """
+    db = sqlite_utils.Database(path)
+    _register_db_for_cleanup(db)
+    _load_extensions(db, load_extension)
+    if not tables:
+        tables = [
+            table.name
+            for table in db.tables
+            if table.virtual_table_using is None and table.detect_fts() is not None
+        ]
+    report = []
+    all_ok = True
+    for table_name in tables:
+        table = db.table(table_name)
+        health = table.fts_health()
+        entry = {
+            "table": table_name,
+            "fts_table": health.fts_table,
+            "ok": health.ok,
+            "problems": health.problems,
+        }
+        if health.fts_table is None:
+            all_ok = False
+        elif not health.ok:
+            if fix:
+                try:
+                    entry["fixed"] = table.repair_fts()
+                    health = table.fts_health()
+                    entry["ok"] = health.ok
+                    entry["problems"] = health.problems
+                except FtsError as ex:
+                    entry["fixed"] = []
+                    entry["problems"] = health.problems + [str(ex)]
+            all_ok = all_ok and entry["ok"]
+        report.append(entry)
+    if json_output:
+        click.echo(json.dumps(report, indent=2))
+    else:
+        for entry in report:
+            if entry["ok"]:
+                click.echo(f"{entry['table']}: ok")
+            else:
+                click.echo(f"{entry['table']}:")
+                for problem in entry["problems"]:
+                    click.echo(f"  {problem}")
+            for action in entry.get("fixed") or []:
+                click.echo(f"  fixed: {action}")
+    if not all_ok:
+        ctx = click.get_current_context()
+        ctx.exit(1)
 
 
 @cli.command(name="enable-wal")

@@ -20,7 +20,7 @@ This page lists the ``--help`` for every ``sqlite-utils`` CLI sub-command.
         "query", "memory", "insert", "upsert", "bulk", "search", "transform", "extract",
         "schema", "insert-files", "analyze-tables", "convert", "tables", "views", "rows",
         "triggers", "indexes", "create-database", "create-table", "create-index", "drop-index",
-        "migrate", "enable-fts", "populate-fts", "rebuild-fts", "disable-fts"
+        "migrate", "enable-fts", "populate-fts", "rebuild-fts", "disable-fts", "check-fts"
     ]
     refs = {
         "query": "cli_query",
@@ -36,6 +36,7 @@ This page lists the ``--help`` for every ``sqlite-utils`` CLI sub-command.
         "triggers": "cli_triggers",
         "indexes": "cli_indexes",
         "enable-fts": "cli_fts",
+        "check-fts": "cli_check_fts",
         "analyze": "cli_analyze",
         "vacuum": "cli_vacuum",
         "dump": "cli_dump",
@@ -1154,6 +1155,37 @@ disable-fts
           sqlite-utils disable-fts chickens.db chickens
 
     Options:
+      --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
+      -h, --help             Show this message and exit.
+
+
+.. _cli_ref_check_fts:
+
+check-fts
+=========
+
+See :ref:`cli_check_fts`.
+
+::
+
+    Usage: sqlite-utils check-fts [OPTIONS] PATH [TABLES]...
+
+      Check full-text search indexes are consistent with their tables
+
+      Reports missing synchronization triggers and stale index content. Exits with a
+      non-zero status if any table fails the check.
+
+      Example:
+
+          sqlite-utils check-fts chickens.db chickens
+
+      Check every table with an FTS index, repairing any problems:
+
+          sqlite-utils check-fts chickens.db --fix
+
+    Options:
+      --fix                  Repair any problems that are found
+      --json                 Output the health report as JSON
       --load-extension TEXT  Path to SQLite extension, with optional :entrypoint
       -h, --help             Show this message and exit.
 

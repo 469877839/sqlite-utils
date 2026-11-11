@@ -732,6 +732,101 @@ def test_rebuild_fts_fixes_docsize_error(db_path):
     assert db.table("fts5_table_fts_docsize").count == 10000
 
 
+def _make_fts_db(db_path):
+    db = Database(db_path)
+    db.table("dogs").insert_all(
+        [
+            {"id": 1, "name": "charlie brown"},
+            {"id": 2, "name": "cleo cat"},
+        ],
+        pk="id",
+    )
+    db.table("dogs").enable_fts(["name"], create_triggers=True)
+    db.close()
+
+
+def test_check_fts_healthy(db_path):
+    _make_fts_db(db_path)
+    result = CliRunner().invoke(cli.cli, ["check-fts", db_path])
+    assert result.exit_code == 0
+    assert result.output == "dogs: ok\n"
+
+
+def test_check_fts_detects_and_fixes(db_path):
+    _make_fts_db(db_path)
+    db = Database(db_path)
+    db.execute("DROP TRIGGER dogs_au")
+    db.execute("update dogs set name = 'rex' where id = 1")
+    db.close()
+    result = CliRunner().invoke(cli.cli, ["check-fts", db_path])
+    assert result.exit_code == 1
+    assert "Missing synchronization triggers: dogs_au" in result.output
+    assert "out of sync" in result.output
+    # --fix repairs the triggers and rebuilds the index
+    result = CliRunner().invoke(cli.cli, ["check-fts", db_path, "--fix"])
+    assert result.exit_code == 0
+    assert "fixed: Recreate synchronization triggers: dogs_au" in result.output
+    assert "fixed: Rebuild FTS index 'dogs_fts'" in result.output
+    # A subsequent check passes, and search results match the table again
+    result = CliRunner().invoke(cli.cli, ["check-fts", db_path])
+    assert result.exit_code == 0
+    assert result.output == "dogs: ok\n"
+    db = Database(db_path)
+    assert [row["id"] for row in db.table("dogs").search("rex")] == [1]
+    db.close()
+
+
+def test_check_fts_json(db_path):
+    _make_fts_db(db_path)
+    db = Database(db_path)
+    db.execute("DROP TRIGGER dogs_au")
+    db.close()
+    result = CliRunner().invoke(cli.cli, ["check-fts", db_path, "--json"])
+    assert result.exit_code == 1
+    report = json.loads(result.output)
+    assert report == [
+        {
+            "table": "dogs",
+            "fts_table": "dogs_fts",
+            "ok": False,
+            "problems": ["Missing synchronization triggers: dogs_au"],
+        }
+    ]
+
+
+def test_check_fts_all_tables(db_path):
+    _make_fts_db(db_path)
+    db = Database(db_path)
+    db.table("cats").insert_all([{"id": 1, "name": "socks"}], pk="id")
+    db.table("cats").enable_fts(["name"], fts_version="FTS4", create_triggers=True)
+    db.table("plain").insert({"x": 1})
+    db.close()
+    # Without table arguments every FTS-enabled table is checked
+    result = CliRunner().invoke(cli.cli, ["check-fts", db_path])
+    assert result.exit_code == 0
+    assert result.output == "dogs: ok\ncats: ok\n"
+
+
+def test_check_fts_table_without_fts(db_path):
+    db = Database(db_path)
+    db.table("plain").insert({"x": 1})
+    db.close()
+    result = CliRunner().invoke(cli.cli, ["check-fts", db_path, "plain"])
+    assert result.exit_code == 1
+    assert "Table 'plain' has no FTS index" in result.output
+
+
+def test_check_fts_fix_reports_unfixable_missing_columns(db_path):
+    _make_fts_db(db_path)
+    db = Database(db_path)
+    db.execute("ALTER TABLE dogs RENAME COLUMN name TO dog_name")
+    db.close()
+    result = CliRunner().invoke(cli.cli, ["check-fts", db_path, "--fix"])
+    assert result.exit_code == 1
+    assert "no longer on 'dogs'" in result.output
+    assert "disable_fts" in result.output
+
+
 @pytest.mark.parametrize(
     "format,expected",
     [
